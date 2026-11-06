@@ -54,3 +54,30 @@ jobs:
       - run: nix build .#images.${{ matrix.arch }} -o image
       - run: nix build .#updates.${{ matrix.arch }} -o update
       - run: du -sh --apparent-size image/*.raw && du -sh image/*.raw update/*
+
+  # The control plane as a container, from every commit on main.
+  server-image:
+    if: github.event_name == 'push'
+    needs: [test, nix]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+      RAILWAY_SERVICE: ${{ vars.RAILWAY_SERVICE }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - run: nix build .#via-server-image
+      - run: |
+          echo "$TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          skopeo copy docker-archive:result "docker://$IMAGE:$GITHUB_SHA"
+          skopeo copy "docker://$IMAGE:$GITHUB_SHA" "docker://$IMAGE:latest"
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # A fork has no Railway service, and skips this.
+      - if: env.RAILWAY_SERVICE != ''
+        run: npx -y @railway/cli@5.71.0 redeploy --from-source --yes --service "$RAILWAY_SERVICE"
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
