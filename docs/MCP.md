@@ -20,7 +20,7 @@ These are the acceptance tests. A tool exists because one of these needs it.
 | Server | Where | Tools |
 | --- | --- | --- |
 | device | `via-agent mcp` on the device (stdio) | `device_health`, `logs`, `journal`, `exec`, `os_update`, `deploy`, `sync_env` |
-| fleet | `via-server` at `/mcp` (HTTP, API token) | `list_fleets`, `device_metrics`, `create_fleet`, `update_fleet`, `update_device`, `delete_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `exec`, `list_os_versions`, `update_os`, `list_releases`, `release_details`, `release_contents`, `os_version_details`, `deploy`, `create_provisioning_image`, `list_provisioning_images`, `list_variables`, `set_variable`, `update_variables`, `delete_variable`, `set_device_type`, `delete_device_type`, `audit_log`, `list_tokens`, `create_token`, `revoke_token` |
+| fleet | `via-server` at `/mcp` (HTTP, API token) | `list_fleets`, `device_metrics`, `create_fleet`, `update_fleet`, `update_device`, `delete_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `exec`, `list_os_versions`, `update_os`, `list_releases`, `release_details`, `release_contents`, `os_version_details`, `deploy`, `create_provisioning_image`, `list_provisioning_images`, `list_variables`, `set_variable`, `update_variables`, `delete_variable`, `set_device_type`, `delete_device_type`, `audit_log`, `list_tokens`, `create_token`, `revoke_token`, `list_grants`, `set_grant`, `delete_grant` |
 | local | `via mcp` on the operator's machine (stdio, root) | `list_disks`, `flash_image`, `flash_status`, `release_app` |
 
 The fleet server forwards device tools over each device's outbound
@@ -74,8 +74,10 @@ describe. [deploy.md](deploy.md#variables-and-secrets) has the precedence.
    variable's value goes in the audit log.
 4. Every fleet call is written to the audit log with the token's name, its
    arguments and whether it succeeded.
-5. A `viewer` token may call only the read-only tools; the rest answer with
-   an error naming the role needed.
+5. A token that isn't an admin's reaches only the fleets its grants cover,
+   and only as far as its role there allows; anything else answers with an
+   error naming the role needed, or as if the fleet or device didn't exist.
+   See "Who can do what" in deploy.md.
 
 ## Provisioning without a rebuild
 

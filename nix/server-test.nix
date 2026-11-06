@@ -35,7 +35,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds("curl -sf http://127.0.0.1:8471/healthz")
 
     admin = machine.succeed("sudo -u via-server VIA_DATA_DIR=/var/lib/via-server via-server token create ana").strip()
-    viewer = machine.succeed("sudo -u via-server VIA_DATA_DIR=/var/lib/via-server via-server token create bo --role viewer").strip()
+    viewer = machine.succeed("sudo -u via-server VIA_DATA_DIR=/var/lib/via-server via-server token create bo --role observer").strip()
 
     machine.fail("curl -sf http://127.0.0.1:8471/mcp -H 'Authorization: Bearer nope' -d '{}'")
 
@@ -45,8 +45,14 @@ pkgs.testers.runNixOSTest {
     assert r["structuredContent"]["fleets"][0]["name"] == "line", r
     r = call(viewer, "create_fleet", {"fleet": "other"})
     assert r.get("isError"), r
+    # A role on one fleet sees only that fleet.
+    call(admin, "create_fleet", {"fleet": "other"})
+    dev = machine.succeed("sudo -u via-server VIA_DATA_DIR=/var/lib/via-server via-server token create ci --role developer --fleet other").strip()
+    r = call(dev, "list_fleets", {})
+    assert [f["name"] for f in r["structuredContent"]["fleets"]] == ["other"], r
+    assert r["structuredContent"]["fleets"][0]["access"] == "developer", r
 
-    # Uploads and tunnels are admin-only.
+    # Base images and OS updates are an admin's.
     machine.fail(f"curl -sf -X PUT http://127.0.0.1:8471/v1/base/x86_64 -H 'Authorization: Bearer {viewer}' -d x")
 
     # Through Caddy, over TLS: the API, a WebSocket upgrade (a device's
@@ -74,7 +80,7 @@ pkgs.testers.runNixOSTest {
     assert "HttpOnly" in headers and "SameSite=Strict" in headers and "Secure" in headers, headers
     cookie = f"-H 'Cookie: via_session={viewer}'"
     who = json.loads(machine.succeed(f"{https}/v1/session {cookie}"))
-    assert who == {"name": "bo", "role": "viewer"}, who
+    assert who == {"name": "bo", "role": "member", "subjects": ["token:bo"]}, who
     machine.fail(f"{https}/v1/session {cookie} -H 'Origin: https://evil.example'")
 
     # Secrets: write-only, and encrypted at rest.

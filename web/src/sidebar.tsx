@@ -6,7 +6,7 @@ import { Mark, ThemeSwitch } from "./main";
 import { Button, Pip } from "./ui";
 import { appPath, osPath, releasePath } from "./pages/catalog";
 import { serviceState } from "./pages/device";
-import { devicePath, fleetPath, useDevices } from "./pages/fleet";
+import { devicePath, fleetPath, useCan, useDevices } from "./pages/fleet";
 
 function Item({ to, active, children }: { to: string; active?: boolean; children: ReactNode }) {
   return (
@@ -40,7 +40,8 @@ function DeviceItems({ fleet, device, tab, current }: { fleet: string; device: s
   });
   const services = Array.isArray(health.data?.services) && d?.online ? health.data.services : [];
   const base = devicePath(fleet, device);
-  const tabs: [string, string][] = [["status", "Status"], ["logs", "Logs"], ["terminal", "Terminal"], ["journal", "Journal"], ["releases", "Releases"], ["variables", "Variables"]];
+  const developer = useCan(fleet, "developer");
+  const tabs = ([["status", "Status"], ["logs", "Logs"], ["terminal", "Terminal"], ["journal", "Journal"], ["releases", "Releases"], ["variables", "Variables"]] as [string, string][]).filter(([t]) => developer || t !== "terminal");
   return (
     <Group
       to={base}
@@ -110,6 +111,7 @@ export function Sidebar({ me, open, onClose }: { me: Caller; open: boolean; onCl
   const release = at("/apps/:app/releases/:release") ?? at("/apps/:app/releases/:release/:view");
   const os = at("/os/:version");
   const admin = me.role === "admin";
+  const developer = useCan(fleet?.fleet, "developer");
 
   useEffect(() => {
     onClose();
@@ -150,12 +152,12 @@ export function Sidebar({ me, open, onClose }: { me: Caller; open: boolean; onCl
               <Item to={`${fleetPath(fleet.fleet)}/variables`} active={fleetTab === "variables"}>
                 Variables
               </Item>
-              {admin && (
+              {developer && (
                 <Item to={`${fleetPath(fleet.fleet)}/enroll`} active={fleetTab === "enroll"}>
                   Enroll
                 </Item>
               )}
-              {admin && (
+              {developer && (
                 <Item to={`${fleetPath(fleet.fleet)}/settings`} active={fleetTab === "settings"}>
                   Settings
                 </Item>
@@ -181,15 +183,19 @@ export function Sidebar({ me, open, onClose }: { me: Caller; open: boolean; onCl
           )}
         </nav>
         <div className="flex-none border-t border-rule py-1">
-          <Item to="/audit" active={pathname.startsWith("/audit")}>
-            Audit
-          </Item>
-          <Item to="/access" active={pathname.startsWith("/access")}>
-            Access
-          </Item>
+          {admin && (
+            <>
+              <Item to="/audit" active={pathname.startsWith("/audit")}>
+                Audit
+              </Item>
+              <Item to="/access" active={pathname.startsWith("/access")}>
+                Access
+              </Item>
+            </>
+          )}
           <p className="label mt-1 truncate border-t border-rule px-3 pt-2">
             {me.name}
-            {me.role === "viewer" && " · viewer"}
+            {admin && " · admin"}
           </p>
           <div className="flex items-center justify-between px-1 pb-1">
             <ThemeSwitch />

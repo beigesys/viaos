@@ -59,11 +59,10 @@ On NixOS, with Caddy getting the certificate:
 Anywhere else, as a container behind any TLS proxy:
 
 ```bash
-nix build .#via-server-image && docker load < result
 docker run -d --name via -p 127.0.0.1:8080:8080 -v via:/data \
   -e VIA_PUBLIC_URL=https://via.example.com \
   -e VIA_TRUSTED_KEYS=<public key> \
-  via-server:latest
+  ghcr.io/beigesys/viaos:latest
 ```
 
 A matching Caddyfile:
@@ -77,6 +76,16 @@ via.example.com {
 The proxy must pass WebSockets through, which Caddy does by default.
 Uploads are gigabytes, so it must not cap request bodies.
 
+CI publishes that image from every commit on `main`, as `:latest` and
+`:<commit>`, for x86_64. To build it yourself:
+`nix build .#via-server-image && docker load < result`, then run
+`via-server:latest`.
+
+On Railway: run the image as a service, with a volume on `/data` and
+`VIA_PUBLIC_URL` and `VIA_ADMIN_TOKEN` set. To redeploy on every commit, give
+the repository a `RAILWAY_SERVICE` variable and a `RAILWAY_TOKEN` secret holding
+a project token.
+
 ## 2. Make yourself a token
 
 ```bash
@@ -84,9 +93,10 @@ sudo -u via-server via-server token create ana            # NixOS
 docker exec via via-server token create ana               # container
 ```
 
-That prints a token once. Roles are `admin` (the default) and `viewer`
-(`--role viewer`): viewers get the read-only tools only. `token list` shows
-when each was last used, and `token revoke <name>` revokes one at once.
+That prints a token once, for an admin unless you give it a role:
+`--role developer --fleet line-07`. See [Who can do what](#who-can-do-what).
+`token list` shows when each was last used, and `token revoke <name>` revokes
+one at once.
 Every tool call is audited under the token's name.
 
 ## 3. Sign what devices run
@@ -226,9 +236,35 @@ bundle. `list_variables` returns each app's newest release's description under
 
 It is the server's own address, with nothing more to install. Navigation is one
 hierarchy, Fleets > fleet > device, with Apps and OS beside it, and the sidebar
-opens out as you go. Sign in with an API token or GitHub; viewers can look but
-not change anything, and only admins get terminals. It calls the same tools
-Claude does, so the audit log covers both.
+opens out as you go. Sign in with an API token or GitHub, and see only the
+fleets you have a role on, with only the controls that role allows. It calls the
+same tools Claude does, so the audit log covers both.
+
+### Who can do what
+
+Admins can do everything. Anyone else gets a role on a fleet, which covers every
+fleet under it, or on every fleet, from the Access page or `set_grant`:
+
+| Role | Can |
+|---|---|
+| Observer | See the fleet's devices, health, logs, journal, releases and variables |
+| Operator | Also change its devices' tags and their own variables |
+| Developer | Also deploy, update the OS, set the fleet's variables, run commands and open terminals on its devices, enroll devices, and add, move or delete fleets under it |
+
+A grant names a GitHub user (`github:<login>`), a GitHub team
+(`github-team:<slug>`), everyone in the GitHub organisation (`github-org`), or an
+API token (`token:<name>`); someone gets the strongest role any of those gives
+them. Fleets and devices outside your grants don't exist for you: they aren't
+listed, and naming one gets "no fleet named". A new server, or one upgraded from
+before roles, grants `github-org` observer on every fleet, which is what members
+could do before; remove that grant to let in only the people and teams you name.
+
+Still an admin's alone: tokens, grants, the audit log, device types, OS updates
+and base images, and fleets at the top level. Uploading an app release needs
+developer on some fleet, since apps aren't any one fleet's.
+
+`via-server token create ci --role developer --fleet line-07` makes a token
+with a role on one fleet; leave out `--fleet` for every fleet.
 
 ### Fleets inside fleets
 
@@ -250,12 +286,12 @@ moves it, tags it, or deletes it once it's empty.
 3. If the organisation restricts OAuth apps, an owner approves this one.
 
 Only active members of the organisation get in. Its owners are admins, and so is
-anyone on the team named by `VIA_GITHUB_ADMIN_TEAM`; other members are viewers.
-To let in only some members, set `VIA_GITHUB_TEAM` (module: `github.team`) to a
-team's slug: its members get in as viewers, admins still get in, and everyone
-else in the organisation is refused. Members of the team's child teams count.
-A session lasts 12 hours, so someone removed from the organisation loses access
-within that time. For GitHub Enterprise Server, set `VIA_GITHUB_URL`.
+anyone on the team named by `VIA_GITHUB_ADMIN_TEAM`. Other members get what
+grants give them, and a member with none is turned away. Team grants are checked
+at sign-in, members of child teams included, so a new team grant reaches someone
+when they next sign in; grants to a user or the organisation apply at once. A
+session lasts 12 hours, so someone removed from the organisation or a team loses
+access within that time. For GitHub Enterprise Server, set `VIA_GITHUB_URL`.
 
 ### Hardware
 

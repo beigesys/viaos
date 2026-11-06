@@ -102,32 +102,46 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 ";
 
+/// Grants: a role (see access::Level, stored as its rank) for a subject on a
+/// fleet, or on every fleet when `fleet_id` is NULL. Made by the first start
+/// that has it, so the migration can carry what viewers could do across.
+const GRANTS: &str = "
+CREATE TABLE grants (
+    subject     TEXT NOT NULL,
+    fleet_id    INTEGER REFERENCES fleets(id),
+    level       INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX grants_identity ON grants (subject, IFNULL(fleet_id, 0));
+";
+
 /// How a console session's token starts, so it is never looked up as an API
 /// token and an API token is never looked up as a session.
 pub const SESSION_PREFIX: &str = "vis_";
 
 /// What a person (or their Claude) may do through the API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
-    /// Everything: fleet changes, uploads, tunnels into devices.
+    /// Everything: every fleet, uploads, tokens, grants, device types.
     Admin,
-    /// Read-only tools: health, logs, lists. Changes nothing.
-    Viewer,
+    /// What their grants give them; see [`crate::access`].
+    Member,
 }
 
 impl Role {
     fn as_str(self) -> &'static str {
         match self {
             Role::Admin => "admin",
-            Role::Viewer => "viewer",
+            Role::Member => "member",
         }
     }
 
     fn parse(s: &str) -> Option<Self> {
         match s {
             "admin" => Some(Role::Admin),
-            "viewer" => Some(Role::Viewer),
+            // Viewers became members with a grant to observe every fleet.
+            "member" | "viewer" => Some(Role::Member),
             _ => None,
         }
     }
@@ -138,6 +152,34 @@ impl Role {
 pub struct Caller {
     pub name: String,
     pub role: Role,
+    /// What grants can name it by; see [`crate::access::check_subject`].
+    pub subjects: Vec<String>,
+}
+
+impl Caller {
+    pub fn admin(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            role: Role::Admin,
+            subjects: Vec::new(),
+        }
+    }
+
+    fn token(name: String, role: Role) -> Self {
+        Self {
+            subjects: vec![format!("token:{name}")],
+            name,
+            role,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Grant {
+    pub subject: String,
+    /// `None`: every fleet.
+    pub fleet: Option<String>,
+    pub level: crate::access::Level,
 }
 
 /// Hardware the server can make images for. Its base image is
@@ -274,6 +316,27 @@ impl Db {
             )?;
         }
         conn.execute_batch(VARIABLES_IDENTITY)?;
+        let has_grants = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'grants'")?
+            .exists([])?;
+        if !has_grants {
+            // Everyone who could look still can: viewer tokens, and every
+            // member of the GitHub organisation. Their sessions end, since
+            // they say nothing of who they answer to.
+            conn.execute_batch(&format!(
+                "BEGIN;
+                 {GRANTS}
+                 INSERT INTO grants (subject, fleet_id, level, created_at)
+                     SELECT 'token:' || name, NULL, 1, unixepoch() FROM api_tokens
+                     WHERE role = 'viewer';
+                 UPDATE api_tokens SET role = 'member' WHERE role = 'viewer';
+                 INSERT INTO grants (subject, fleet_id, level, created_at)
+                     VALUES ('github-org', NULL, 1, unixepoch());
+                 DELETE FROM sessions WHERE role != 'admin';
+                 ALTER TABLE sessions ADD COLUMN subjects TEXT NOT NULL DEFAULT '';
+                 COMMIT;"
+            ))?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -393,6 +456,7 @@ impl Db {
         anyhow::ensure!(children == 0, "{name:?} still has fleets under it");
         let tx = c.transaction()?;
         tx.execute("DELETE FROM fleet_tags WHERE fleet_id = ?1", [id])?;
+        tx.execute("DELETE FROM grants WHERE fleet_id = ?1", [id])?;
         tx.execute("DELETE FROM enrollment_tokens WHERE fleet_id = ?1", [id])?;
         tx.execute(
             "DELETE FROM variables WHERE scope = 'fleet' AND target = ?1",
@@ -646,7 +710,7 @@ impl Db {
             let role: String = r.get(1)?;
             Ok(ApiToken {
                 name: r.get(0)?,
-                role: Role::parse(&role).unwrap_or(Role::Viewer),
+                role: Role::parse(&role).unwrap_or(Role::Member),
                 created_at: r.get(2)?,
                 last_used: r.get(3)?,
             })
@@ -655,9 +719,73 @@ impl Db {
     }
 
     pub fn revoke_api_token(&self, name: &str) -> Result<()> {
-        let c = self.conn.lock().unwrap();
-        let n = c.execute("DELETE FROM api_tokens WHERE name = ?1", [name])?;
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        let n = tx.execute("DELETE FROM api_tokens WHERE name = ?1", [name])?;
         anyhow::ensure!(n == 1, "no token named {name:?}");
+        tx.execute(
+            "DELETE FROM grants WHERE subject = ?1",
+            [format!("token:{name}")],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn grants(&self) -> Result<Vec<Grant>> {
+        let c = self.conn.lock().unwrap();
+        let mut q = c.prepare(
+            "SELECT g.subject, f.name, g.level FROM grants g
+             LEFT JOIN fleets f ON f.id = g.fleet_id
+             ORDER BY g.subject, f.name IS NOT NULL, f.name",
+        )?;
+        let rows = q.query_map([], |r| {
+            let level: i64 = r.get(2)?;
+            Ok(Grant {
+                subject: r.get(0)?,
+                fleet: r.get(1)?,
+                level: crate::access::Level::from_rank(level)
+                    .unwrap_or(crate::access::Level::Observer),
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Give `subject` a role on `fleet`, or on every fleet, replacing the one
+    /// it had there.
+    pub fn set_grant(
+        &self,
+        subject: &str,
+        fleet: Option<&str>,
+        level: crate::access::Level,
+    ) -> Result<()> {
+        crate::access::check_subject(subject)?;
+        let c = self.conn.lock().unwrap();
+        if let Some(name) = subject.strip_prefix("token:") {
+            let known = c
+                .prepare("SELECT 1 FROM api_tokens WHERE name = ?1")?
+                .exists([name])?;
+            anyhow::ensure!(known, "no token named {name:?}");
+        }
+        let fleet = fleet.map(|f| fleet_id(&c, f)).transpose()?;
+        c.execute(
+            "DELETE FROM grants WHERE subject = ?1 AND IFNULL(fleet_id, 0) = IFNULL(?2, 0)",
+            params![subject, fleet],
+        )?;
+        c.execute(
+            "INSERT INTO grants (subject, fleet_id, level, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![subject, fleet, level.rank(), now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_grant(&self, subject: &str, fleet: Option<&str>) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        let fleet = fleet.map(|f| fleet_id(&c, f)).transpose()?;
+        let n = c.execute(
+            "DELETE FROM grants WHERE subject = ?1 AND IFNULL(fleet_id, 0) = IFNULL(?2, 0)",
+            params![subject, fleet],
+        )?;
+        anyhow::ensure!(n > 0, "{subject} has no grant there");
         Ok(())
     }
 
@@ -702,13 +830,20 @@ impl Db {
     }
 
     /// Start a console session for someone an outside provider vouched for.
-    pub fn create_session(&self, name: &str, role: Role, ttl_secs: i64) -> Result<String> {
+    pub fn create_session(&self, caller: &Caller, ttl_secs: i64) -> Result<String> {
         let token = format!("{SESSION_PREFIX}{}", random_secret());
         let c = self.conn.lock().unwrap();
         c.execute("DELETE FROM sessions WHERE expires_at <= ?1", [now()])?;
         c.execute(
-            "INSERT INTO sessions (token_hash, name, role, expires_at) VALUES (?1, ?2, ?3, ?4)",
-            params![hash(&token), name, role.as_str(), now() + ttl_secs],
+            "INSERT INTO sessions (token_hash, name, role, expires_at, subjects)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                hash(&token),
+                caller.name,
+                caller.role.as_str(),
+                now() + ttl_secs,
+                caller.subjects.join("\n")
+            ],
         )?;
         Ok(token)
     }
@@ -716,17 +851,23 @@ impl Db {
     /// Who a console session belongs to, while it lasts.
     pub fn session_caller(&self, token: &str) -> Result<Option<Caller>> {
         let c = self.conn.lock().unwrap();
-        let row: Option<(String, String)> = c
+        let row: Option<(String, String, String)> = c
             .query_row(
-                "SELECT name, role FROM sessions WHERE token_hash = ?1 AND expires_at > ?2",
+                "SELECT name, role, subjects FROM sessions
+                 WHERE token_hash = ?1 AND expires_at > ?2",
                 params![hash(token), now()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        Ok(row.and_then(|(name, role)| {
+        Ok(row.and_then(|(name, role, subjects)| {
             Some(Caller {
                 name,
                 role: Role::parse(&role)?,
+                subjects: subjects
+                    .split('\n')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect(),
             })
         }))
     }
@@ -747,12 +888,7 @@ impl Db {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        Ok(row.and_then(|(name, role)| {
-            Some(Caller {
-                name,
-                role: Role::parse(&role)?,
-            })
-        }))
+        Ok(row.and_then(|(name, role)| Some(Caller::token(name, Role::parse(&role)?))))
     }
 
     pub fn audit(&self, actor: &str, tool: &str, args: &serde_json::Value, ok: bool) {
@@ -1192,9 +1328,18 @@ mod tests {
     #[test]
     fn a_session_ends_when_it_expires() {
         let (_d, db) = db();
-        let live = db.create_session("github/a", Role::Viewer, 60).unwrap();
-        let dead = db.create_session("github/b", Role::Admin, -1).unwrap();
-        assert_eq!(db.session_caller(&live).unwrap().unwrap().name, "github/a");
+        let a = Caller {
+            name: "github/a".into(),
+            role: Role::Member,
+            subjects: vec!["github:a".into(), "github-org".into()],
+        };
+        let live = db.create_session(&a, 60).unwrap();
+        let dead = db.create_session(&Caller::admin("github/b"), -1).unwrap();
+        let back = db.session_caller(&live).unwrap().unwrap();
+        assert_eq!(
+            (back.name, back.role, back.subjects),
+            (a.name, a.role, a.subjects)
+        );
         assert!(db.session_caller(&dead).unwrap().is_none());
         // A session is not an API token, and the other way round.
         assert!(db.api_caller(&live).unwrap().is_none());
@@ -1241,14 +1386,102 @@ mod tests {
     #[test]
     fn api_tokens_authenticate_until_revoked() {
         let (_d, db) = db();
-        let token = db.create_api_token("ana", Role::Viewer).unwrap();
+        let token = db.create_api_token("ana", Role::Member).unwrap();
         assert!(db.create_api_token("ana", Role::Admin).is_err());
         let caller = db.api_caller(&token).unwrap().unwrap();
-        assert_eq!((caller.name.as_str(), caller.role), ("ana", Role::Viewer));
+        assert_eq!((caller.name.as_str(), caller.role), ("ana", Role::Member));
+        assert_eq!(caller.subjects, ["token:ana"]);
         assert!(db.api_tokens().unwrap()[0].last_used.is_some());
         assert!(db.api_caller("via_nope").unwrap().is_none());
+        db.set_grant("token:ana", None, crate::access::Level::Observer)
+            .unwrap();
         db.revoke_api_token("ana").unwrap();
         assert!(db.api_caller(&token).unwrap().is_none());
+        // Its grants go with it, so a new token by that name starts with none.
+        assert!(
+            !db.grants()
+                .unwrap()
+                .iter()
+                .any(|g| g.subject == "token:ana")
+        );
+        assert!(
+            db.set_grant("token:ana", None, crate::access::Level::Observer)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn viewers_keep_what_they_could_do() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("via.db");
+        {
+            // A database from before grants.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            c.execute_batch(
+                "INSERT INTO api_tokens (name, role, token_hash, created_at)
+                     VALUES ('ana', 'viewer', 'h1', 0), ('ci', 'admin', 'h2', 0);
+                 INSERT INTO sessions VALUES ('s1', 'github/bob', 'viewer', 9999999999),
+                                             ('s2', 'github/root', 'admin', 9999999999);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let g: Vec<_> = db
+            .grants()
+            .unwrap()
+            .into_iter()
+            .map(|g| (g.subject, g.fleet, g.level))
+            .collect();
+        use crate::access::Level::Observer;
+        assert_eq!(
+            g,
+            [
+                ("github-org".into(), None, Observer),
+                ("token:ana".into(), None, Observer)
+            ]
+        );
+        let roles: Vec<_> = db
+            .api_tokens()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.role)
+            .collect();
+        assert_eq!(roles, [Role::Member, Role::Admin]);
+        let c = db.conn.lock().unwrap();
+        let left: Vec<String> = c
+            .prepare("SELECT name FROM sessions")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, ["github/root"]);
+        drop(c);
+        // Opening again changes nothing.
+        drop(db);
+        assert_eq!(Db::open(&path).unwrap().grants().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_fleet_takes_its_grants_with_it() {
+        let (_d, db) = db();
+        db.create_fleet("line").unwrap();
+        db.set_grant("github:bob", Some("line"), crate::access::Level::Developer)
+            .unwrap();
+        db.set_grant("github:bob", Some("line"), crate::access::Level::Operator)
+            .unwrap();
+        let mine = |db: &Db| {
+            db.grants()
+                .unwrap()
+                .into_iter()
+                .filter(|g| g.subject == "github:bob")
+                .map(|g| g.level)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(mine(&db), [crate::access::Level::Operator]);
+        db.delete_fleet("line").unwrap();
+        assert!(mine(&db).is_empty());
     }
 
     #[test]

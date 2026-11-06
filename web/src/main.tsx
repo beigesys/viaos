@@ -27,7 +27,7 @@ const client = new QueryClient({
   },
 });
 
-const Me = createContext<Caller>({ name: "", role: "viewer" });
+const Me = createContext<Caller>({ name: "", role: "member" });
 export const useMe = () => useContext(Me);
 export const useIsAdmin = () => useMe().role === "admin";
 

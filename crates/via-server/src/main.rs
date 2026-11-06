@@ -19,8 +19,10 @@
 //! - `/mcp`                   fleet MCP, Streamable HTTP, bearer token
 //!
 //! People authenticate with API tokens made by `via-server token create`.
-//! Viewers get the read-only tools; admins get everything.
+//! Admins may do everything; anyone else what grants give them, fleet by
+//! fleet (see `access`).
 
+mod access;
 mod db;
 mod github;
 mod hub;
@@ -103,14 +105,25 @@ enum DeviceTypeCommand {
     },
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum TokenRole {
+    Admin,
+    Developer,
+    Operator,
+    Observer,
+}
+
 #[derive(clap::Subcommand)]
 enum TokenCommand {
     /// Create a token and print it. It is shown only this once.
     Create {
         /// Who it is for, e.g. `ana` or `ci`.
         name: String,
+        /// `admin`, or a role on `--fleet` (every fleet without it).
         #[arg(long, value_enum, default_value = "admin")]
-        role: db::Role,
+        role: TokenRole,
+        #[arg(long)]
+        fleet: Option<String>,
     },
     /// List tokens: name, role, and when each was last used.
     List,
@@ -152,16 +165,12 @@ struct Serve {
     #[arg(long, env = "VIA_GITHUB_CLIENT_SECRET", hide_env_values = true)]
     github_client_secret: Option<String>,
     /// Only members of this organisation can sign in. Its owners are admins;
-    /// other members are viewers.
+    /// other members get what grants give them.
     #[arg(long, env = "VIA_GITHUB_ORG")]
     github_org: Option<String>,
     /// Slug of a team in the organisation whose members are also admins.
     #[arg(long, env = "VIA_GITHUB_ADMIN_TEAM")]
     github_admin_team: Option<String>,
-    /// Slug of a team in the organisation: only its members (and admins) may
-    /// sign in. Unset, every member may, as a viewer.
-    #[arg(long, env = "VIA_GITHUB_TEAM")]
-    github_team: Option<String>,
     /// A GitHub Enterprise Server's address.
     #[arg(long, env = "VIA_GITHUB_URL", default_value = "https://github.com")]
     github_url: String,
@@ -207,8 +216,17 @@ async fn main() -> Result<()> {
         Command::Token(t) => {
             let db = Db::open(&cli.data_dir.join("via.db"))?;
             match t {
-                TokenCommand::Create { name, role } => {
-                    println!("{}", db.create_api_token(&name, role)?)
+                TokenCommand::Create { name, role, fleet } => {
+                    let level = match role {
+                        TokenRole::Admin => None,
+                        TokenRole::Developer => Some(access::Level::Developer),
+                        TokenRole::Operator => Some(access::Level::Operator),
+                        TokenRole::Observer => Some(access::Level::Observer),
+                    };
+                    println!(
+                        "{}",
+                        access::create_token(&db, &name, level, fleet.as_deref())?
+                    )
                 }
                 TokenCommand::List => {
                     println!("{}", serde_json::to_string_pretty(&db.api_tokens()?)?)
@@ -275,7 +293,6 @@ async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
             client_secret,
             org,
             admin_team: cli.github_admin_team,
-            team: cli.github_team,
             url: cli.github_url.trim_end_matches('/').to_string(),
         }),
         _ => anyhow::bail!(
@@ -309,10 +326,17 @@ async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
 }
 
 fn router(state: Arc<State>) -> Router {
-    // MCP checks roles per tool; everything else here is admin-only.
+    // MCP checks access per tool, and these per fleet; what's below them is
+    // admin-only.
     let people = Router::new()
         .nest_service("/mcp", mcp::service(state.clone()))
         .route("/v1/session", get(whoami))
+        .route(
+            "/v1/releases/{app}/{release}/{arch}",
+            axum::routing::put(upload_release),
+        )
+        .route("/v1/devices/{device}/tunnel/{port}", get(tunnel))
+        .route("/v1/devices/{device}/shell", get(shell))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -320,16 +344,10 @@ fn router(state: Arc<State>) -> Router {
         ));
     let admin = Router::new()
         .route(
-            "/v1/releases/{app}/{release}/{arch}",
-            axum::routing::put(upload_release),
-        )
-        .route(
             "/v1/os/{arch}/{version}/{file}",
             axum::routing::put(upload_os_file),
         )
         .route("/v1/base/{arch}", axum::routing::put(upload_base))
-        .route("/v1/devices/{device}/tunnel/{port}", get(tunnel))
-        .route("/v1/devices/{device}/shell", get(shell))
         .with_state(state.clone())
         .layer(middleware::from_fn(require_admin))
         .layer(middleware::from_fn_with_state(
@@ -394,10 +412,7 @@ async fn require_caller(AxState(s): AxState<Arc<State>>, mut req: Request, next:
         return (StatusCode::FORBIDDEN, "cross-origin request").into_response();
     }
     let caller = if s.admin_token_hash.as_deref() == Some(db::hash(token).as_str()) {
-        Some(db::Caller {
-            name: "admin".into(),
-            role: db::Role::Admin,
-        })
+        Some(db::Caller::admin("admin"))
     } else if by_cookie && token.starts_with(db::SESSION_PREFIX) {
         s.db.session_caller(token).ok().flatten()
     } else {
@@ -446,10 +461,7 @@ async fn sign_in(
 ) -> Response {
     let token = body.token.trim();
     let caller = if s.admin_token_hash.as_deref() == Some(db::hash(token).as_str()) {
-        Some(db::Caller {
-            name: "admin".into(),
-            role: db::Role::Admin,
-        })
+        Some(db::Caller::admin("admin"))
     } else {
         s.db.api_caller(token).ok().flatten()
     };
@@ -611,6 +623,11 @@ async fn upload_release(
     body: Body,
 ) -> Response {
     let result = async {
+        // Apps aren't any fleet's, so whoever deploys to some fleet may add one.
+        anyhow::ensure!(
+            access::Access::load(&s.db, &caller)?.anywhere(access::Level::Developer),
+            "uploading a release needs developer on some fleet"
+        );
         let path = releases::bundle_path(&s.releases_dir(), &app, release, &arch)?;
         anyhow::ensure!(
             !path.exists(),
@@ -715,6 +732,23 @@ async fn upload_base(
     uploaded(result)
 }
 
+/// The device, if the caller is a developer on its fleet. Someone who can't
+/// see it at all is told it doesn't exist.
+fn developer_on(
+    s: &State,
+    caller: &db::Caller,
+    device: &str,
+    what: &str,
+) -> anyhow::Result<db::Device> {
+    let d = s.db.resolve(device)?;
+    let a = access::Access::load(&s.db, caller)?;
+    if !a.sees(&d.fleet) {
+        anyhow::bail!("no device named {device:?}");
+    }
+    a.require(&d.fleet, access::Level::Developer, what)?;
+    Ok(d)
+}
+
 /// A TCP stream to `port` on a device, carried over the device's own
 /// connection: SSH to a device behind NAT is `ssh -o ProxyCommand='via
 /// tunnel %h 22'`. The WebSocket's binary messages are the stream's bytes.
@@ -724,9 +758,8 @@ async fn tunnel(
     Path((device, port)): Path<(String, u16)>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let opened =
-        s.db.resolve(&device)
-            .and_then(|d| s.hub.open(&d.id, &format!("tcp:{port}")));
+    let opened = developer_on(&s, &caller, &device, "a tunnel")
+        .and_then(|d| s.hub.open(&d.id, &format!("tcp:{port}")));
     s.db.audit(
         &caller.name,
         "tunnel",
@@ -758,8 +791,7 @@ async fn shell(
         None => "shell".to_string(),
     };
     let opened =
-        s.db.resolve(&device)
-            .and_then(|d| s.hub.open(&d.id, &service));
+        developer_on(&s, &caller, &device, "a terminal").and_then(|d| s.hub.open(&d.id, &service));
     s.db.audit(
         &caller.name,
         "shell",

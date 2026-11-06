@@ -20,13 +20,27 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::State;
-use crate::db::{Caller, Role};
+use crate::access::{Access, Level};
+use crate::db::Caller;
 use crate::image;
 
 tokio::task_local! {
     /// Who the tool call in progress is for.
     static CALLER: Caller;
 }
+
+/// Tools only an admin may call: they reach past any one fleet.
+const ADMIN_TOOLS: &[&str] = &[
+    "audit_log",
+    "list_tokens",
+    "create_token",
+    "revoke_token",
+    "list_grants",
+    "set_grant",
+    "delete_grant",
+    "set_device_type",
+    "delete_device_type",
+];
 
 const INSTRUCTIONS: &str = "\
 You manage a fleet of viaos edge devices. `list_devices` is the map: every \
@@ -271,17 +285,72 @@ impl Fleet {
         Ok(result.unwrap_or_else(failed))
     }
 
+    /// What the caller of the tool in progress may do.
+    fn access(&self) -> anyhow::Result<Access> {
+        let caller = CALLER
+            .try_with(Clone::clone)
+            .map_err(|_| anyhow::anyhow!("no caller"))?;
+        Access::load(&self.state.db, &caller)
+    }
+
+    /// A device the caller has `need` on. One they can't see doesn't exist.
+    fn device_for(
+        &self,
+        device: &str,
+        need: Level,
+        what: &str,
+    ) -> anyhow::Result<crate::db::Device> {
+        let a = self.access()?;
+        let d = self
+            .state
+            .db
+            .resolve(device)
+            .ok()
+            .filter(|d| a.sees(&d.fleet))
+            .ok_or_else(|| {
+                anyhow::anyhow!("no device named {device:?}; `list_devices` shows them")
+            })?;
+        a.require(&d.fleet, need, what)?;
+        Ok(d)
+    }
+
+    /// A fleet the caller has `need` on.
+    fn fleet_for(&self, fleet: &str, need: Level, what: &str) -> anyhow::Result<()> {
+        let a = self.access()?;
+        anyhow::ensure!(
+            a.sees(fleet) && self.state.db.fleets()?.iter().any(|f| f.name == fleet),
+            "no fleet named {fleet:?}; `list_fleets` shows them"
+        );
+        a.require(fleet, need, what)
+    }
+
+    /// Where a new fleet, or one moving, may go: under a fleet the caller is
+    /// a developer on, or to the top for an admin.
+    fn may_place(&self, parent: Option<&str>, what: &str) -> anyhow::Result<()> {
+        match parent {
+            Some(p) => self.fleet_for(p, Level::Developer, what),
+            None => self
+                .access()?
+                .require_admin(&format!("{what} at the top level")),
+        }
+    }
+
     async fn forward(
         &self,
         device: &str,
         tool: &str,
         args: JsonObject,
+        need: Level,
     ) -> anyhow::Result<CallToolResult> {
-        let d = self.state.db.resolve(device)?;
+        let d = self.device_for(device, need, &format!("`{tool}`"))?;
         self.state.hub.call(&d.id, tool, args).await
     }
 
     fn device_list(&self, fleet: Option<&str>) -> anyhow::Result<Value> {
+        if let Some(f) = fleet {
+            self.fleet_for(f, Level::Observer, "listing its devices")?;
+        }
+        let access = self.access()?;
         let updates = self.state.db.os_updates()?;
         let fleets = self.state.db.fleets()?;
         let devices: Vec<Value> = self
@@ -289,6 +358,7 @@ impl Fleet {
             .db
             .devices(fleet)?
             .into_iter()
+            .filter(|d| access.sees(&d.fleet))
             .map(|d| {
                 let online = self.state.hub.is_online(&d.id);
                 let mut v = serde_json::to_value(&d).unwrap_or_default();
@@ -311,6 +381,7 @@ impl Fleet {
     ) -> anyhow::Result<Vec<crate::db::Device>> {
         match (fleet, device) {
             (Some(f), None) => {
+                self.fleet_for(f, Level::Developer, "this")?;
                 let d = self.state.db.devices(Some(f))?;
                 anyhow::ensure!(
                     !d.is_empty(),
@@ -318,7 +389,7 @@ impl Fleet {
                 );
                 Ok(d)
             }
-            (None, Some(d)) => Ok(vec![self.state.db.resolve(d)?]),
+            (None, Some(d)) => Ok(vec![self.device_for(d, Level::Developer, "this")?]),
             _ => anyhow::bail!("give exactly one of `fleet` or `device`"),
         }
     }
@@ -482,6 +553,12 @@ impl Fleet {
             anyhow::anyhow!("no such device type; there are: {}", known.join(", "))
         })?;
         let base = image::base_image(&s.images_dir, device_type)?;
+        if s.db.fleets()?.iter().any(|f| f.name == a.fleet) {
+            self.fleet_for(&a.fleet, Level::Developer, "enrolling a device")?;
+        } else {
+            self.access()?
+                .require_admin("making a new fleet at the top level")?;
+        }
         s.db.create_fleet(&a.fleet)?;
         // The token goes into the image and nowhere else: not into this
         // result, the audit log, or the server's own log.
@@ -627,9 +704,35 @@ pub struct TokenNameArg {
 pub struct CreateTokenArgs {
     /// Who or what the token is for.
     pub name: String,
-    /// `viewer` gets read-only tools. Defaults to `admin`.
+    /// A role on `fleet`: observer, operator or developer. Omit for an admin
+    /// token, which may do everything.
+    #[serde(default)]
+    pub role: Option<Level>,
+    /// The fleet `role` is for, and every fleet under it. Omit for every fleet.
+    #[serde(default)]
+    pub fleet: Option<String>,
+    /// The same as role observer on every fleet.
     #[serde(default)]
     pub viewer: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GrantArgs {
+    /// Who: `github:<login>`, `github-team:<slug>`, `github-org` (every
+    /// member of the organisation), or `token:<name>`.
+    pub subject: String,
+    /// The fleet, which includes every fleet under it. Omit for every fleet.
+    #[serde(default)]
+    pub fleet: Option<String>,
+    pub role: Level,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GrantAt {
+    pub subject: String,
+    /// Omit for the grant on every fleet.
+    #[serde(default)]
+    pub fleet: Option<String>,
 }
 
 /// A value aimed at a service the newest release says does not take the name
@@ -658,17 +761,20 @@ fn valid_key(key: &str) -> bool {
 }
 
 impl Fleet {
-    /// `("fleet", name)` or `("device", id)`, from arguments naming exactly one.
+    /// `("fleet", name)` or `("device", id)`, from arguments naming exactly
+    /// one. A fleet's values are a developer's to change, a device's an
+    /// operator's.
     fn scope(&self, a: &VariableArgs) -> anyhow::Result<(&'static str, String)> {
         match (&a.fleet, &a.device) {
             (Some(f), None) => {
-                anyhow::ensure!(
-                    self.state.db.fleets()?.iter().any(|x| &x.name == f),
-                    "no fleet named {f:?}; `list_fleets` shows them"
-                );
+                self.fleet_for(f, Level::Developer, "changing its variables")?;
                 Ok(("fleet", f.clone()))
             }
-            (None, Some(d)) => Ok(("device", self.state.db.resolve(d)?.id)),
+            (None, Some(d)) => Ok((
+                "device",
+                self.device_for(d, Level::Operator, "changing its variables")?
+                    .id,
+            )),
             _ => anyhow::bail!("give exactly one of `fleet` or `device`"),
         }
     }
@@ -717,14 +823,32 @@ impl Fleet {
 impl Fleet {
     #[tool(
         name = "list_fleets",
-        description = "List fleets: each one's parent, tags and how many devices it directly \
-                       holds. Fleets nest; a fleet's variables, deploys and updates reach \
-                       every fleet under it. Reads only.",
+        description = "List fleets: each one's parent, tags, how many devices it directly \
+                       holds, and `access`, the caller's role on it (observer, operator or \
+                       developer). Fleets nest; a fleet's variables, deploys, updates and \
+                       grants reach every fleet under it. Reads only.",
         annotations(title = "List fleets", read_only_hint = true, open_world_hint = false)
     )]
     async fn list_fleets(&self) -> Result<CallToolResult, ErrorData> {
         self.audited("list_fleets", json!({}), async {
-            Ok(rendered(json!({ "fleets": self.state.db.fleets()? })))
+            let a = self.access()?;
+            let fleets: Vec<Value> = self
+                .state
+                .db
+                .fleets()?
+                .into_iter()
+                .filter_map(|f| {
+                    let level = a.level(&f.name)?;
+                    let mut v = serde_json::to_value(&f).ok()?;
+                    // A parent they can't see is no parent of theirs.
+                    if f.parent.as_deref().is_some_and(|p| !a.sees(p)) {
+                        v["parent"] = Value::Null;
+                    }
+                    v["access"] = json!(level);
+                    Some(v)
+                })
+                .collect();
+            Ok(rendered(json!({ "fleets": fleets })))
         })
         .await
     }
@@ -745,10 +869,8 @@ impl Fleet {
     ) -> Result<CallToolResult, ErrorData> {
         let args = json!({ "fleet": a.fleet, "parent": a.parent, "tags": a.tags });
         self.audited("create_fleet", args, async {
+            self.may_place(a.parent.as_deref(), "creating a fleet")?;
             let known = self.state.db.fleets()?;
-            if let Some(p) = &a.parent {
-                anyhow::ensure!(known.iter().any(|f| &f.name == p), "no fleet named {p:?}");
-            }
             let existed = known.iter().any(|f| f.name == a.fleet);
             self.state.db.create_fleet(&a.fleet)?;
             if !existed {
@@ -781,6 +903,15 @@ impl Fleet {
         Parameters(a): Parameters<DeleteFleetArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.audited("delete_fleet", json!({ "fleet": a.fleet }), async {
+            self.fleet_for(&a.fleet, Level::Observer, "deleting it")?;
+            let parent = self
+                .state
+                .db
+                .fleets()?
+                .into_iter()
+                .find(|f| f.name == a.fleet)
+                .and_then(|f| f.parent);
+            self.may_place(parent.as_deref(), "deleting a fleet")?;
             self.state.db.delete_fleet(&a.fleet)?;
             Ok(rendered(json!({ "deleted": a.fleet })))
         })
@@ -807,8 +938,10 @@ impl Fleet {
                 !(a.top_level && a.parent.is_some()),
                 "give `parent` or `top_level`, not both"
             );
+            self.fleet_for(&a.fleet, Level::Developer, "changing it")?;
             let moved = a.top_level || a.parent.is_some();
             if moved {
+                self.may_place(a.parent.as_deref(), "moving a fleet")?;
                 self.state
                     .db
                     .set_fleet_parent(&a.fleet, a.parent.as_deref())?;
@@ -843,7 +976,7 @@ impl Fleet {
     ) -> Result<CallToolResult, ErrorData> {
         let args = json!({ "device": a.device, "tags": a.tags });
         self.audited("update_device", args, async {
-            let d = self.state.db.resolve(&a.device)?;
+            let d = self.device_for(&a.device, Level::Operator, "changing its tags")?;
             self.state.db.set_device_tags(&d.id, &a.tags)?;
             Ok(rendered(json!({ "device": d.name, "tags": a.tags })))
         })
@@ -885,8 +1018,13 @@ impl Fleet {
         Parameters(a): Parameters<DeviceArg>,
     ) -> Result<CallToolResult, ErrorData> {
         self.audited("device_health", json!({ "device": a.device }), async {
-            self.forward(&a.device, "device_health", JsonObject::new())
-                .await
+            self.forward(
+                &a.device,
+                "device_health",
+                JsonObject::new(),
+                Level::Observer,
+            )
+            .await
         })
         .await
     }
@@ -913,7 +1051,7 @@ impl Fleet {
         if let Some(since) = a.since {
             args.insert("since".into(), json!(since));
         }
-        self.forward(&a.device, "device_metrics", args)
+        self.forward(&a.device, "device_metrics", args, Level::Observer)
             .await
             .map_err(|e| ErrorData::internal_error(format!("{e:#}"), None))
     }
@@ -938,7 +1076,7 @@ impl Fleet {
             if let Some(t) = a.tail {
                 fwd.insert("tail".into(), json!(t));
             }
-            self.forward(&a.device, "logs", fwd).await
+            self.forward(&a.device, "logs", fwd, Level::Observer).await
         })
         .await
     }
@@ -965,7 +1103,8 @@ impl Fleet {
                 if let Some(l) = a.limit {
                     fwd.insert("limit".into(), json!(l));
                 }
-                self.forward(&a.device, "journal", fwd).await
+                self.forward(&a.device, "journal", fwd, Level::Observer)
+                    .await
             },
         )
         .await
@@ -988,7 +1127,7 @@ impl Fleet {
             if let Some(t) = a.timeout_secs {
                 fwd.insert("timeout_secs".into(), json!(t.min(55)));
             }
-            self.forward(&a.device, "exec", fwd).await
+            self.forward(&a.device, "exec", fwd, Level::Developer).await
         })
         .await
     }
@@ -1183,12 +1322,20 @@ impl Fleet {
     )]
     async fn list_variables(&self) -> Result<CallToolResult, ErrorData> {
         self.audited("list_variables", json!({}), async {
+            let access = self.access()?;
             let devices = self.state.db.devices(None)?;
             let vars: Vec<Value> = self
                 .state
                 .db
                 .variables()?
                 .into_iter()
+                .filter(|v| match v.scope.as_str() {
+                    "device" => devices
+                        .iter()
+                        .find(|d| d.id == v.target)
+                        .is_some_and(|d| access.sees(&d.fleet)),
+                    _ => access.sees(&v.target),
+                })
                 .map(|v| {
                     let target = match v.scope.as_str() {
                         "device" => devices
@@ -1462,13 +1609,79 @@ impl Fleet {
         &self,
         Parameters(a): Parameters<CreateTokenArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let args = json!({ "name": a.name, "viewer": a.viewer });
+        let args = json!({ "name": a.name, "role": a.role, "fleet": a.fleet, "viewer": a.viewer });
         self.audited("create_token", args, async {
-            let role = if a.viewer { Role::Viewer } else { Role::Admin };
-            let token = self.state.db.create_api_token(&a.name, role)?;
-            Ok(rendered(
-                json!({ "name": a.name, "role": role, "token": token }),
-            ))
+            let level = a.role.or(a.viewer.then_some(Level::Observer));
+            let token =
+                crate::access::create_token(&self.state.db, &a.name, level, a.fleet.as_deref())?;
+            Ok(rendered(json!({
+                "name": a.name,
+                "role": level.map_or("admin", Level::as_str),
+                "fleet": a.fleet,
+                "token": token,
+            })))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "list_grants",
+        description = "Who may do what where: each grant gives a subject (a GitHub user or \
+                       team, every member of the GitHub organisation, or an API token) a role \
+                       on a fleet and every fleet under it, or on every fleet. Roles: \
+                       observer looks; operator also changes devices' tags and variables; \
+                       developer also deploys, updates the OS, sets fleet variables, runs \
+                       commands and enrolls devices. Admins can do everything and need no \
+                       grant. Reads only.",
+        annotations(title = "List grants", read_only_hint = true, open_world_hint = false)
+    )]
+    async fn list_grants(&self) -> Result<CallToolResult, ErrorData> {
+        self.audited("list_grants", json!({}), async {
+            Ok(rendered(json!({ "grants": self.state.db.grants()? })))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "set_grant",
+        description = "Give a subject a role on a fleet (and every fleet under it), or on \
+                       every fleet, replacing the role it had there. Takes effect on its next \
+                       request; someone signed in with GitHub picks up a new team grant when \
+                       they next sign in.",
+        annotations(title = "Set grant", read_only_hint = false, destructive_hint = false)
+    )]
+    async fn set_grant(
+        &self,
+        Parameters(a): Parameters<GrantArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let args = json!({ "subject": a.subject, "fleet": a.fleet, "role": a.role });
+        self.audited("set_grant", args.clone(), async {
+            self.state
+                .db
+                .set_grant(&a.subject, a.fleet.as_deref(), a.role)?;
+            Ok(rendered(args))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "delete_grant",
+        description = "Take a subject's grant on a fleet, or on every fleet, away. Takes \
+                       effect on its next request.",
+        annotations(
+            title = "Delete grant",
+            read_only_hint = false,
+            destructive_hint = true
+        )
+    )]
+    async fn delete_grant(
+        &self,
+        Parameters(a): Parameters<GrantAt>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let args = json!({ "subject": a.subject, "fleet": a.fleet });
+        self.audited("delete_grant", args.clone(), async {
+            self.state.db.delete_grant(&a.subject, a.fleet.as_deref())?;
+            Ok(rendered(json!({ "deleted": args })))
         })
         .await
     }
@@ -1506,6 +1719,7 @@ impl Fleet {
     async fn list_provisioning_images(&self) -> Result<CallToolResult, ErrorData> {
         self.audited("list_provisioning_images", json!({}), async {
             let s = &self.state;
+            let access = self.access()?;
             let device_types: Vec<Value> =
                 s.db.device_types()?
                     .into_iter()
@@ -1528,9 +1742,18 @@ impl Fleet {
                         let Ok(meta) = std::fs::metadata(&raw) else {
                             continue;
                         };
+                        let fleet =
+                            std::fs::read_to_string(s.out_dir().join(format!("{id}.fleet"))).ok();
+                        // The download link is all it takes to enroll a device.
+                        if !fleet
+                            .as_deref()
+                            .is_some_and(|f| access.can(f, Level::Developer))
+                        {
+                            continue;
+                        }
                         images.push(json!({
                             "file": std::fs::read_to_string(&path).unwrap_or_default(),
-                            "fleet": std::fs::read_to_string(s.out_dir().join(format!("{id}.fleet"))).ok(),
+                            "fleet": fleet,
                             "download": format!("{}/v1/images/{id}", s.public_url),
                             "size_mb": meta.len() / 1_048_576,
                             "created_at": meta.modified().ok()
@@ -1627,8 +1850,9 @@ impl Fleet {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Fleet {
-    /// Every call runs as the caller the HTTP layer authenticated. A viewer
-    /// may call only tools marked read-only.
+    /// Every call runs as the caller the HTTP layer authenticated. Tools
+    /// that reach past one fleet are an admin's; the rest check the fleet
+    /// they act on.
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
@@ -1640,16 +1864,10 @@ impl ServerHandler for Fleet {
             .and_then(|p| p.extensions.get::<Caller>())
             .cloned()
             .ok_or_else(|| ErrorData::invalid_request("not authenticated", None))?;
-        let read_only = self
-            .tool_router
-            .get(&request.name)
-            .and_then(|t| t.annotations.as_ref())
-            .and_then(|a| a.read_only_hint)
-            == Some(true);
-        if caller.role == Role::Viewer && !read_only {
+        if caller.role != crate::db::Role::Admin && ADMIN_TOOLS.contains(&request.name.as_ref()) {
             let msg = format!(
-                "{} is a viewer; `{}` needs an admin token",
-                caller.name, request.name
+                "`{}` needs an admin; {} isn't one",
+                request.name, caller.name
             );
             return Ok(CallToolResult::error(vec![ContentBlock::text(msg)]).into());
         }
@@ -1692,4 +1910,393 @@ fn inherited(fleets: &[crate::db::Fleet], fleet: &str) -> Vec<String> {
         at = found.and_then(|f| f.parent.as_deref());
     }
     tags
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::{Value, json};
+
+    use crate::access::{self, Level};
+    use crate::db::Enrollment;
+
+    /// A server with the tree acme > acme-east > line-07, and `other` beside
+    /// it, a device in line-07 and one in other.
+    struct Rig {
+        url: String,
+        state: Arc<crate::State>,
+        http: reqwest::Client,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn rig() -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let state = crate::test_state(dir.path(), &url, None);
+        let db = &state.db;
+        for f in ["acme", "acme-east", "line-07", "other"] {
+            db.create_fleet(f).unwrap();
+        }
+        db.set_fleet_parent("acme-east", Some("acme")).unwrap();
+        db.set_fleet_parent("line-07", Some("acme-east")).unwrap();
+        for (fleet, name) in [("line-07", "press"), ("other", "far")] {
+            let token = db.mint_token(fleet, Some(name), 60, None).unwrap();
+            db.enroll(&Enrollment {
+                token,
+                hostname: name.into(),
+                arch: Some("x86_64".into()),
+                os_version: Some("1".into()),
+                agent_version: None,
+            })
+            .unwrap();
+        }
+        let router = crate::router(state.clone());
+        tokio::spawn(async move { axum::serve(l, router).await });
+        Rig {
+            url,
+            state,
+            http: reqwest::Client::new(),
+            _dir: dir,
+        }
+    }
+
+    impl Rig {
+        /// A token holding `level` on `fleet`, or an admin's with no level.
+        fn token(&self, name: &str, level: Option<Level>, fleet: Option<&str>) -> String {
+            access::create_token(&self.state.db, name, level, fleet).unwrap()
+        }
+
+        /// Call a tool; `Ok` with its result, or `Err` with what it said.
+        async fn call(&self, token: &str, tool: &str, args: Value) -> Result<Value, String> {
+            let body: Value = self
+                .http
+                .post(format!("{}/mcp", self.url))
+                .bearer_auth(token)
+                .header("Accept", "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2026-07-28")
+                .header("Mcp-Method", "tools/call")
+                .header("Mcp-Name", tool)
+                .json(&json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {
+                        "name": tool, "arguments": args,
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientInfo": { "name": "t", "version": "0" },
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    },
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if let Some(e) = body.get("error") {
+                return Err(e["message"].as_str().unwrap_or_default().to_string());
+            }
+            let r = &body["result"];
+            let text = r["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if r["isError"] == json!(true) {
+                Err(text)
+            } else {
+                Ok(r["structuredContent"].clone())
+            }
+        }
+
+        async fn refused(&self, token: &str, tool: &str, args: Value) -> String {
+            match self.call(token, tool, args.clone()).await {
+                Ok(v) => panic!("{tool} {args} was allowed: {v}"),
+                Err(e) => e,
+            }
+        }
+
+        async fn names(&self, token: &str, tool: &str, list: &str) -> Vec<String> {
+            let v = self.call(token, tool, json!({})).await.unwrap();
+            v[list]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x["name"].as_str().unwrap().to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_observer_sees_its_fleets_and_changes_nothing() {
+        let r = rig().await;
+        let t = r.token("obs", Some(Level::Observer), Some("acme-east"));
+        assert_eq!(
+            r.names(&t, "list_fleets", "fleets").await,
+            ["acme-east", "line-07"]
+        );
+        let fleets = r.call(&t, "list_fleets", json!({})).await.unwrap();
+        // acme is above what it can see, so it isn't its parent.
+        assert_eq!(fleets["fleets"][0]["parent"], Value::Null);
+        assert_eq!(fleets["fleets"][0]["access"], "observer");
+        assert_eq!(r.names(&t, "list_devices", "devices").await, ["press"]);
+
+        // A device elsewhere doesn't exist for it.
+        let e = r.refused(&t, "logs", json!({ "device": "far" })).await;
+        assert!(e.starts_with("no device named \"far\""), "{e}");
+        let e = r
+            .refused(&t, "list_devices", json!({ "fleet": "other" }))
+            .await;
+        assert!(e.starts_with("no fleet named"), "{e}");
+        // Its own device: allowed, and only offline.
+        let e = r.refused(&t, "logs", json!({ "device": "press" })).await;
+        assert!(
+            !e.contains("observer") && !e.starts_with("no device"),
+            "{e}"
+        );
+
+        for (tool, args) in [
+            (
+                "deploy",
+                json!({ "app": "a", "release": 1, "fleet": "line-07", "dry_run": true }),
+            ),
+            (
+                "update_os",
+                json!({ "version": "2", "device": "press", "dry_run": true }),
+            ),
+            ("exec", json!({ "device": "press", "command": "true" })),
+            ("update_device", json!({ "device": "press", "tags": ["x"] })),
+            (
+                "set_variable",
+                json!({ "app": "a", "key": "K", "device": "press", "value": "v" }),
+            ),
+            (
+                "create_fleet",
+                json!({ "fleet": "new", "parent": "line-07" }),
+            ),
+        ] {
+            let e = r.refused(&t, tool, args).await;
+            assert!(e.contains("is an observer on"), "{tool}: {e}");
+        }
+        for tool in ["audit_log", "list_tokens", "list_grants", "set_device_type"] {
+            let e = r.refused(&t, tool, json!({})).await;
+            assert!(e.contains("needs an admin"), "{tool}: {e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_operator_looks_after_devices_but_not_the_fleet() {
+        let r = rig().await;
+        let t = r.token("op", Some(Level::Operator), Some("line-07"));
+        r.call(
+            &t,
+            "update_device",
+            json!({ "device": "press", "tags": ["site=a"] }),
+        )
+        .await
+        .unwrap();
+        r.call(
+            &t,
+            "set_variable",
+            json!({ "app": "a", "key": "K", "device": "press", "value": "v" }),
+        )
+        .await
+        .unwrap();
+        let vars = r.call(&t, "list_variables", json!({})).await.unwrap();
+        assert_eq!(vars["variables"].as_array().unwrap().len(), 1);
+        for (tool, args) in [
+            (
+                "set_variable",
+                json!({ "app": "a", "key": "K", "fleet": "line-07", "value": "v" }),
+            ),
+            (
+                "deploy",
+                json!({ "app": "a", "release": 1, "device": "press", "dry_run": true }),
+            ),
+            ("exec", json!({ "device": "press", "command": "true" })),
+            ("update_fleet", json!({ "fleet": "line-07", "tags": ["x"] })),
+        ] {
+            let e = r.refused(&t, tool, args).await;
+            assert!(e.contains("is an operator on"), "{tool}: {e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_developer_runs_its_part_of_the_tree() {
+        let r = rig().await;
+        let t = r.token("dev", Some(Level::Developer), Some("acme-east"));
+        let plan = r
+            .call(
+                &t,
+                "deploy",
+                json!({ "app": "a", "release": 1, "fleet": "acme-east", "dry_run": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan["devices"][0]["device"], "press");
+        r.call(
+            &t,
+            "update_os",
+            json!({ "version": "2", "fleet": "line-07", "dry_run": true }),
+        )
+        .await
+        .unwrap();
+        r.call(
+            &t,
+            "set_variable",
+            json!({ "app": "a", "key": "K", "fleet": "line-07", "value": "v" }),
+        )
+        .await
+        .unwrap();
+        r.call(
+            &t,
+            "create_fleet",
+            json!({ "fleet": "line-08", "parent": "acme-east" }),
+        )
+        .await
+        .unwrap();
+        r.call(
+            &t,
+            "update_fleet",
+            json!({ "fleet": "line-08", "parent": "line-07" }),
+        )
+        .await
+        .unwrap();
+        r.call(&t, "delete_fleet", json!({ "fleet": "line-08" }))
+            .await
+            .unwrap();
+
+        // Not above or beside it, and not at the top.
+        let e = r
+            .refused(&t, "create_fleet", json!({ "fleet": "top" }))
+            .await;
+        assert!(e.contains("needs an admin"), "{e}");
+        let e = r
+            .refused(&t, "delete_fleet", json!({ "fleet": "acme-east" }))
+            .await;
+        assert!(
+            e.contains("is an observer on") || e.starts_with("no fleet named \"acme\""),
+            "{e}"
+        );
+        let e = r
+            .refused(
+                &t,
+                "update_fleet",
+                json!({ "fleet": "line-07", "parent": "other" }),
+            )
+            .await;
+        assert!(e.starts_with("no fleet named \"other\""), "{e}");
+        let e = r
+            .refused(
+                &t,
+                "deploy",
+                json!({ "app": "a", "release": 1, "device": "far", "dry_run": true }),
+            )
+            .await;
+        assert!(e.starts_with("no device named"), "{e}");
+        let e = r
+            .refused(
+                &t,
+                "set_grant",
+                json!({ "subject": "github:x", "role": "observer" }),
+            )
+            .await;
+        assert!(e.contains("needs an admin"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn an_admin_hands_out_grants() {
+        let r = rig().await;
+        let admin = r.token("root", None, None);
+        let t = r.token("later", Some(Level::Observer), Some("other"));
+        assert_eq!(r.names(&t, "list_devices", "devices").await, ["far"]);
+        r.call(
+            &admin,
+            "set_grant",
+            json!({ "subject": "token:later", "fleet": "acme", "role": "developer" }),
+        )
+        .await
+        .unwrap();
+        // It takes effect on the next request.
+        assert_eq!(
+            r.names(&t, "list_devices", "devices").await,
+            ["far", "press"]
+        );
+        let grants = r.call(&admin, "list_grants", json!({})).await.unwrap();
+        assert!(
+            grants["grants"].as_array().unwrap().contains(
+                &json!({ "subject": "token:later", "fleet": "acme", "level": "developer" })
+            )
+        );
+        r.call(
+            &admin,
+            "delete_grant",
+            json!({ "subject": "token:later", "fleet": "acme" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.names(&t, "list_devices", "devices").await, ["far"]);
+        let e = r
+            .refused(
+                &admin,
+                "set_grant",
+                json!({ "subject": "bob", "role": "observer" }),
+            )
+            .await;
+        assert!(e.contains("is not a subject"), "{e}");
+        // The admin sees everything.
+        assert_eq!(
+            r.names(&admin, "list_devices", "devices").await,
+            ["far", "press"]
+        );
+        let made = r
+            .call(
+                &admin,
+                "create_token",
+                json!({ "name": "ci", "role": "developer", "fleet": "line-07" }),
+            )
+            .await
+            .unwrap();
+        let ci = made["token"].as_str().unwrap();
+        assert_eq!(r.names(ci, "list_devices", "devices").await, ["press"]);
+    }
+
+    #[tokio::test]
+    async fn uploads_and_terminals_check_the_fleet() {
+        let r = rig().await;
+        let obs = r.token("obs", Some(Level::Observer), None);
+        let dev = r.token("dev", Some(Level::Developer), Some("line-07"));
+        let put = |token: String| {
+            let req = r
+                .http
+                .put(format!("{}/v1/releases/a/1/x86_64", r.url))
+                .bearer_auth(token)
+                .body("not a bundle");
+            async move { req.send().await.unwrap() }
+        };
+        let refused = put(obs.clone()).await;
+        assert_eq!(refused.status(), 400);
+        assert!(refused.text().await.unwrap().contains("needs developer"));
+        assert_eq!(put(dev.clone()).await.status(), 200);
+        // OS updates reach every fleet, so they stay an admin's.
+        let os = r
+            .http
+            .put(format!("{}/v1/os/x86_64/2/manifest.json", r.url))
+            .bearer_auth(&dev)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(os.status(), 403);
+
+        let caller = |t: &str| r.state.db.api_caller(t).unwrap().unwrap();
+        let e = crate::developer_on(&r.state, &caller(&obs), "press", "a terminal").unwrap_err();
+        assert!(e.to_string().contains("a terminal needs developer"), "{e}");
+        let e = crate::developer_on(&r.state, &caller(&dev), "far", "a terminal").unwrap_err();
+        assert_eq!(e.to_string(), "no device named \"far\"");
+        crate::developer_on(&r.state, &caller(&dev), "press", "a terminal").unwrap();
+    }
 }

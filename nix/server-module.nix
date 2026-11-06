@@ -72,17 +72,12 @@ in
       org = mkOption {
         type = types.nullOr types.str;
         default = null;
-        description = "Only members of this organisation can sign in. Its owners are admins; other members are viewers.";
+        description = "Only members of this organisation can sign in. Its owners are admins; other members get what grants give them.";
       };
       adminTeam = mkOption {
         type = types.nullOr types.str;
         default = null;
         description = "Slug of a team in the organisation whose members are also admins.";
-      };
-      team = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        description = "Slug of a team in the organisation: only its members, and admins, can sign in. Unset, every member can, as a viewer.";
       };
     };
   };
@@ -113,9 +108,6 @@ in
       }
       // lib.optionalAttrs (cfg.github.adminTeam != null) {
         VIA_GITHUB_ADMIN_TEAM = cfg.github.adminTeam;
-      }
-      // lib.optionalAttrs (cfg.github.team != null) {
-        VIA_GITHUB_TEAM = cfg.github.team;
       };
       serviceConfig = {
         ExecStart = "${lib.getExe cfg.package} serve";

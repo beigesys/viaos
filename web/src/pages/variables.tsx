@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { lazy, Suspense, useState } from "react";
 import { diff, format, parse, type Change } from "../envtext";
 import { ago, tool, type Schema, type SchemaVariable, type Variable } from "../lib";
-import { useIsAdmin } from "../main";
+import { useCan } from "./fleet";
 import { Badge, Button, Checkbox, Combobox, Empty, Failure, Input, Section } from "../ui";
 
 const Editor = lazy(() => import("../editor"));
@@ -317,7 +317,8 @@ function AppVariables({ app, at, own, inherited, schema, admin }: { app: string;
 /** The values set on one fleet or device, and what it inherits from the
  *  fleets above: `inherits` is those, outermost first. */
 export function ScopeVariables({ scope, target, inherits, app: runningApp }: { scope: "fleet" | "device"; target: string; inherits: string[]; app?: string }) {
-  const admin = useIsAdmin();
+  // A fleet's values are a developer's; a device's own, an operator's.
+  const admin = useCan(scope === "fleet" ? target : inherits[inherits.length - 1], scope === "fleet" ? "developer" : "operator");
   const vars = useVariables();
   const releases = useApps();
   const schemas = vars.data?.schemas ?? [];

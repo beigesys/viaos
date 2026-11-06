@@ -2,8 +2,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { byVersionDesc, gb, tool, type OsVersion, type Release } from "../lib";
-import { useIsAdmin } from "../main";
 import { Badge, Button, Empty, Failure, Modal, Section } from "../ui";
+import { useCan, useDevices } from "./fleet";
 
 export type Run = { title: string; tool: string; args: Record<string, unknown>; warning?: string; verbs?: [string, string] };
 
@@ -64,7 +64,9 @@ const rowClass = "row grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 g
 
 /** What can be sent to this fleet or device. Where you are says where it goes. */
 export function Deployables({ target, base, label, running = [], runningOs = [], os = true, arch }: { target: { fleet: string } | { device: string }; base: string; label: string; running?: { app: string; release: string }[]; runningOs?: string[]; os?: boolean; arch?: string | null }) {
-  const admin = useIsAdmin();
+  const devices = useDevices();
+  const fleet = "fleet" in target ? target.fleet : devices.data?.find((d) => d.name === target.device)?.fleet;
+  const admin = useCan(fleet, "developer");
   const releases = useQuery({
     queryKey: ["releases"],
     queryFn: () => tool<{ releases: Release[] }>("list_releases").then((r) => r.releases),

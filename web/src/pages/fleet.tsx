@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { ago, fleetTags, hasTag, lineage, tagChoices, tool, under, type Device, type Fleet } from "../lib";
+import { ago, atLeast, fleetTags, hasTag, lineage, tagChoices, tool, under, type Device, type Fleet, type Level } from "../lib";
 import { useIsAdmin } from "../main";
 import { Button, buttonClass, Combobox, Empty, Failure, Field, Headline, Input, Modal, Pip, Readout, Section, Tag } from "../ui";
 import { useRunning } from "./catalog";
@@ -23,6 +23,13 @@ export function useFleets() {
     queryFn: () => tool<{ fleets: Fleet[] }>("list_fleets").then((r) => r.fleets),
     refetchInterval: 15000,
   });
+}
+
+/** Whether the caller holds `need` on `fleet`. Admins hold everything. */
+export function useCan(fleet: string | undefined, need: Level) {
+  const admin = useIsAdmin();
+  const fleets = useFleets();
+  return admin || atLeast(fleets.data?.find((f) => f.name === fleet)?.access, need);
 }
 
 /** Breadcrumbs down to a fleet. With `include`, the fleet itself is one of them. */
@@ -238,8 +245,12 @@ function SettingsTab({ fleet, fleets }: { fleet: string; fleets: Fleet[] }) {
       qc.invalidateQueries({ queryKey: ["devices"] });
     },
   });
+  const admin = useIsAdmin();
+  // Moving or deleting it is up to whoever runs where it would go, or went.
+  const placeable = (p: string | null) => (p ? admin || atLeast(fleets.find((f) => f.name === p)?.access, "developer") : admin);
   if (!me) return null;
-  const canDelete = me.devices === 0 && !fleets.some((f) => f.parent === fleet);
+  const empty = me.devices === 0 && !fleets.some((f) => f.parent === fleet);
+  const canDelete = empty && placeable(me.parent);
   const inside = under(fleets, fleet);
   const known = fleets.flatMap((f) => f.tags);
   return (
@@ -252,9 +263,9 @@ function SettingsTab({ fleet, fleets }: { fleet: string; fleets: Fleet[] }) {
             mono
             className="flex-1"
             value={me.parent ?? ""}
-            disabled={update.isPending}
+            disabled={update.isPending || !placeable(me.parent)}
             onChange={(p) => p !== (me.parent ?? "") && update.mutate(p ? { parent: p } : { top_level: true })}
-            options={[{ value: "", label: "Nothing (top level)" }, ...fleets.filter((f) => !inside.includes(f.name)).map((f) => ({ value: f.name, label: f.name, detail: lineage(fleets, f.name).slice(0, -1).join(" / ") || undefined }))]}
+            options={[...(admin ? [{ value: "", label: "Nothing (top level)" }] : []), ...fleets.filter((f) => !inside.includes(f.name) && placeable(f.name)).map((f) => ({ value: f.name, label: f.name, detail: lineage(fleets, f.name).slice(0, -1).join(" / ") || undefined }))]}
           />
         </div>
       </Section>
@@ -263,7 +274,7 @@ function SettingsTab({ fleet, fleets }: { fleet: string; fleets: Fleet[] }) {
       </div>
       <Section title="Delete">
         <div className="row justify-between gap-3">
-          <span className="min-w-0 text-sm text-ink-2">{canDelete ? "Empty" : "Not empty, so it can't be deleted"}</span>
+          <span className="min-w-0 text-sm text-ink-2">{!empty ? "Not empty, so it can't be deleted" : canDelete ? "Empty" : me.parent ? `Deleting it needs developer on ${me.parent}` : "Deleting it needs an admin"}</span>
           <Button tone="danger" size="sm" disabled={!canDelete || remove.isPending} onClick={() => confirm(`Delete fleet ${fleet}?`) && remove.mutate()}>
             Delete fleet
           </Button>
@@ -273,7 +284,7 @@ function SettingsTab({ fleet, fleets }: { fleet: string; fleets: Fleet[] }) {
   );
 }
 
-function DevicesTab({ fleet, devices, loaded, admin, hasChildren }: { fleet: string; devices: Device[]; loaded: boolean; admin: boolean; hasChildren: boolean }) {
+function DevicesTab({ fleet, devices, loaded, canEnroll, hasChildren }: { fleet: string; devices: Device[]; loaded: boolean; canEnroll: boolean; hasChildren: boolean }) {
   const [filter, setFilter] = useState("");
   const shown = devices
     .filter((d) => !filter || `${d.name} ${d.arch} ${d.os_version} ${d.tags.join(" ")}`.toLowerCase().includes(filter.toLowerCase()))
@@ -284,7 +295,7 @@ function DevicesTab({ fleet, devices, loaded, admin, hasChildren }: { fleet: str
       <div className="border border-rule bg-sheet px-3">
         <Empty title="No devices in this fleet yet.">
           <p className="mb-3">Make an image, boot a device from it, and it shows up here.</p>
-          {admin && (
+          {canEnroll && (
             <Link className={buttonClass("primary")} to={`${fleetPath(fleet)}/enroll`}>
               Enroll a device
             </Link>
@@ -360,8 +371,8 @@ function FleetReleases({ fleet, tree, devices }: { fleet: string; tree: string[]
 
 /** One fleet: its devices, what it runs, its settings, and how devices join it. */
 export function FleetPage() {
-  const admin = useIsAdmin();
   const { fleet = "", tab } = useParams();
+  const developer = useCan(fleet, "developer");
   const fleets = useFleets();
   const devices = useDevices();
   const all = fleets.data ?? [];
@@ -401,7 +412,7 @@ export function FleetPage() {
                 <Readout n={off} label="offline" state={off ? "bad" : "off"} />
               </span>
             )}
-            {admin && !title && <AddFleet parent={fleet} />}
+            {developer && !title && <AddFleet parent={fleet} />}
           </>
         }
       >
@@ -411,13 +422,13 @@ export function FleetPage() {
       {(!tab || tab === "devices") && (
         <>
           {children.length > 0 && <FleetTable rows={children} all={all} devices={devices.data ?? []} />}
-          <DevicesTab fleet={fleet} devices={mine} loaded={devices.isSuccess} admin={admin} hasChildren={children.length > 0} />
+          <DevicesTab fleet={fleet} devices={mine} loaded={devices.isSuccess} canEnroll={developer} hasChildren={children.length > 0} />
         </>
       )}
       {tab === "releases" && <FleetReleases fleet={fleet} tree={tree} devices={everything} />}
       {tab === "variables" && <ScopeVariables scope="fleet" target={fleet} inherits={lineage(all, fleet).slice(0, -1)} />}
       {tab === "enroll" && <EnrollTab fleet={fleet} />}
-      {tab === "settings" && <SettingsTab fleet={fleet} fleets={all} />}
+      {tab === "settings" && developer && <SettingsTab fleet={fleet} fleets={all} />}
     </>
   );
 }

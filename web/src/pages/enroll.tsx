@@ -1,8 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { ago, gb, tool } from "../lib";
-import { useIsAdmin } from "../main";
 import { Button, buttonClass, Combobox, Copy, Empty, Failure, Field, Input, Notice, Section, Textarea } from "../ui";
+import { useCan } from "./fleet";
 
 type Image = { file: string; fleet?: string | null; download: string; size_mb: number; created_at?: number };
 type DeviceType = { id: string; name: string; arch: string; detail: string; ready: boolean };
@@ -29,7 +29,7 @@ function Written({ image }: { image: Image }) {
 }
 
 export function EnrollTab({ fleet }: { fleet: string }) {
-  const admin = useIsAdmin();
+  const allowed = useCan(fleet, "developer");
   const qc = useQueryClient();
   const [hostname, setHostname] = useState("");
   const [picked, setPicked] = useState("");
@@ -88,10 +88,10 @@ export function EnrollTab({ fleet }: { fleet: string }) {
               </Notice>
             )}
             <Failure error={make.error} />
-            <Button tone="primary" type="submit" disabled={!admin || !fleet || make.isPending || !chosen?.ready}>
+            <Button tone="primary" type="submit" disabled={!allowed || !fleet || make.isPending || !chosen?.ready}>
               {make.isPending ? "Making it, up to a minute…" : "Make image"}
             </Button>
-            {!admin && <p className="text-xs text-ink-3">Viewers can't make images.</p>}
+            {!allowed && <p className="text-xs text-ink-3">Making images needs developer on {fleet}.</p>}
           </form>
         </Section>
 

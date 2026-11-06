@@ -46,7 +46,12 @@ export async function tool<T = any>(name: string, args: Record<string, unknown> 
   }
 }
 
-export type Caller = { name: string; role: "admin" | "viewer" };
+export type Caller = { name: string; role: "admin" | "member" };
+
+/** A role on a fleet. Each can do what the ones before it can. */
+export type Level = "observer" | "operator" | "developer";
+const RANK: Record<Level, number> = { observer: 1, operator: 2, developer: 3 };
+export const atLeast = (has: Level | undefined, need: Level) => !!has && RANK[has] >= RANK[need];
 
 export async function whoami(): Promise<Caller | null> {
   const res = await fetch("/v1/session");
@@ -112,7 +117,8 @@ export type Metrics = {
   volumes: { name: string; declared: boolean; used_by: string[]; mb: number | null; containers?: number }[] | null;
 };
 
-export type Fleet = { name: string; parent: string | null; tags: string[]; devices: number };
+/** `access` is the caller's role on it. */
+export type Fleet = { name: string; parent: string | null; tags: string[]; devices: number; access: Level };
 
 /** A fleet and those above it, outermost first. */
 export function lineage(fleets: Fleet[], name: string): string[] {

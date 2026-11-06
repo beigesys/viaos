@@ -2,10 +2,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ago, byVersionDesc, duration, gb, lineage, tool, type Health, type MetricSample, type Metrics, type OsUpdate, type OsVersion } from "../lib";
-import { useIsAdmin } from "../main";
 import { Terminal } from "../terminal";
 import { Button, Checkbox, Combobox, Failure, Headline, Input, Notice, Pip, Section } from "../ui";
-import { devicePath, fleetTrail, TagEditor, useDevices, useFleets } from "./fleet";
+import { devicePath, fleetTrail, TagEditor, useCan, useDevices, useFleets } from "./fleet";
 import { ScopeVariables } from "./variables";
 import { Deployables, RunDialog, type Run } from "./releases";
 
@@ -364,9 +363,10 @@ function Storage({ m }: { m: Metrics }) {
 }
 
 export function DevicePage() {
-  const admin = useIsAdmin();
   const nav = useNavigate();
   const { fleet = "", device: name = "", tab: tabParam, container } = useParams();
+  const developer = useCan(fleet, "developer");
+  const operator = useCan(fleet, "operator");
   const devices = useDevices();
   const device = devices.data?.find((d) => d.name === name && d.fleet === fleet);
   const online = !!device?.online;
@@ -463,7 +463,7 @@ export function DevicePage() {
                   <span className="min-w-0 flex-1">Service</span>
                   <span className="w-14 text-right">CPU</span>
                   <span className="w-16 text-right">Memory</span>
-                  {admin && <span className="w-12" />}
+                  {developer && <span className="w-12" />}
                 </div>
               )}
               {services.map((s) => (
@@ -475,7 +475,7 @@ export function DevicePage() {
                   </Link>
                   <span className="w-14 text-right font-mono text-xs">{percent(latest?.services[s.service]?.cpu_percent)}</span>
                   <span className="w-16 text-right font-mono text-xs">{amount(latest?.services[s.service]?.memory_mb)}</span>
-                  {admin && (
+                  {developer && (
                     <span className="w-12 text-right">
                       {s.container && (
                         <Button tone="quiet" size="sm" title={`Shell in ${s.container}`} onClick={() => open("terminal", s.container!)}>
@@ -517,9 +517,9 @@ export function DevicePage() {
                   OS {h.os.update.version}: {h.os.update.error ?? `${h.os.update.state}${h.os.update.progress_percent != null ? ` ${h.os.update.progress_percent}%` : ""}`}
                 </p>
               )}
-              {admin && <OsUpdate device={name} arch={device?.arch} current={device?.os_version} disabled={!online} />}
+              {developer && <OsUpdate device={name} arch={device?.arch} current={device?.os_version} disabled={!online} />}
             </Section>
-            <TagEditor tags={device?.tags ?? []} inherited={device?.inherited_tags} known={(devices.data ?? []).flatMap((d) => d.tags)} pending={tagging.isPending} readOnly={!admin} onChange={(tags) => tagging.mutate(tags)} />
+            <TagEditor tags={device?.tags ?? []} inherited={device?.inherited_tags} known={(devices.data ?? []).flatMap((d) => d.tags)} pending={tagging.isPending} readOnly={!operator} onChange={(tags) => tagging.mutate(tags)} />
             <Failure error={tagging.error} />
             {metrics && <Storage m={metrics} />}
             {metrics && metrics.processes.length > 0 && (
@@ -544,7 +544,7 @@ export function DevicePage() {
         if (!s) return h ? <p className="py-4 text-sm text-ink-2">No service called {container} in the running release.</p> : null;
         return (
           <>
-            <Section title="Now" aside={admin && s.container ? <Button tone="quiet" size="sm" onClick={() => open("terminal", s.container!)}>Shell</Button> : undefined}>
+            <Section title="Now" aside={developer && s.container ? <Button tone="quiet" size="sm" onClick={() => open("terminal", s.container!)}>Shell</Button> : undefined}>
               <Row k="State" v={<span className="inline-flex items-center gap-2"><Pip state={serviceState(s)} />{stateWord(s)}</span>} />
               <Row k="CPU" v={percent(now?.cpu_percent)} />
               <Row k="Memory" v={amount(now?.memory_mb)} />
@@ -558,7 +558,7 @@ export function DevicePage() {
       })()}
       {tab === "logs" && (online ? <div className="h-[calc(100dvh-5.5rem)]"><Logs device={name} services={services.map((s) => s.service)} service={logService} setService={showLogs} /></div> : needsDevice("Logs live on the device, so it has to be connected."))}
       {tab === "terminal" && !online && needsDevice("A shell needs the device to be connected.")}
-      {admin && online && shellsOpened && (
+      {developer && online && shellsOpened && (
         <div className={tab === "terminal" ? "h-[calc(100dvh-5.5rem)]" : "hidden"}>
           <Shells device={name} services={services} visible={tab === "terminal"} container={container} onSelect={(c) => open("terminal", c)} />
         </div>

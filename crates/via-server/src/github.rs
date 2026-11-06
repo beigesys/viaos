@@ -1,8 +1,9 @@
 //! Signing in to the console with GitHub, limited to one organisation.
 //!
-//! Membership decides who gets in and the role: organisation owners are
-//! admins, and so is anyone on the configured admin team; other members are
-//! viewers. With a team configured, only its members get in as viewers. GitHub's access token is used for those checks and then dropped.
+//! Organisation owners are admins, and so is anyone on the configured admin
+//! team. Other members get what grants give them (see [`crate::access`]):
+//! as themselves, as members of a team a grant names, and as members of the
+//! organisation. A member with no grant at all is turned away. GitHub's access token is used for those checks and then dropped.
 //! Access lasts as long as the session, so someone removed from the
 //! organisation loses it within [`SESSION_SECS`].
 
@@ -16,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::State;
-use crate::db::{self, Role};
+use crate::db::{self, Caller, Role};
 
 pub const SESSION_SECS: i64 = 12 * 3600;
 const STATE_COOKIE: &str = "via_oauth_state";
@@ -27,9 +28,6 @@ pub struct Config {
     pub client_secret: String,
     pub org: String,
     pub admin_team: Option<String>,
-    /// Slug of the team whose members may sign in as viewers. Unset, any
-    /// member of the organisation may.
-    pub team: Option<String>,
     /// `https://github.com`, or a GitHub Enterprise Server address.
     pub url: String,
 }
@@ -49,7 +47,7 @@ impl Config {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refused {
     NotMember,
-    NotOnTeam,
+    NoAccess,
     Restricted,
 }
 
@@ -57,7 +55,7 @@ impl Refused {
     fn code(&self) -> &'static str {
         match self {
             Refused::NotMember => "not_member",
-            Refused::NotOnTeam => "not_on_team",
+            Refused::NoAccess => "no_access",
             Refused::Restricted => "restricted",
         }
     }
@@ -152,8 +150,28 @@ pub async fn callback(
     let Some(code) = &q.code else {
         return back_to_console("failed");
     };
-    let (login, role) = match identify(g, &callback_url(&s), code).await {
-        Ok((login, Ok(role))) => (login, role),
+    // Only teams some grant names are worth asking GitHub about.
+    let teams: Vec<String> = match s.db.grants() {
+        Ok(g) => g
+            .into_iter()
+            .filter_map(|g| g.subject.strip_prefix("github-team:").map(String::from))
+            .collect(),
+        Err(e) => {
+            tracing::error!("reading grants: {e:#}");
+            return back_to_console("failed");
+        }
+    };
+    let identified = identify(g, &callback_url(&s), code, &teams)
+        .await
+        .map(|(login, caller)| {
+            let caller = caller.and_then(|c| match crate::access::Access::load(&s.db, &c) {
+                Ok(a) if a.any() => Ok(c),
+                _ => Err(Refused::NoAccess),
+            });
+            (login, caller)
+        });
+    let caller = match identified {
+        Ok((_, Ok(caller))) => caller,
         Ok((login, Err(refused))) => {
             s.db.audit(
                 &format!("github/{login}"),
@@ -168,8 +186,8 @@ pub async fn callback(
             return back_to_console("failed");
         }
     };
-    let name = format!("github/{login}");
-    let session = match s.db.create_session(&name, role, SESSION_SECS) {
+    let name = caller.name.clone();
+    let session = match s.db.create_session(&caller, SESSION_SECS) {
         Ok(t) => t,
         Err(e) => {
             tracing::error!("creating a session: {e:#}");
@@ -219,7 +237,8 @@ async fn identify(
     g: &Config,
     redirect_uri: &str,
     code: &str,
-) -> Result<(String, Result<Role, Refused>)> {
+    teams: &[String],
+) -> Result<(String, Result<Caller, Refused>)> {
     let http = reqwest::Client::builder()
         .user_agent("via-server")
         .timeout(std::time::Duration::from_secs(15))
@@ -287,15 +306,24 @@ async fn identify(
     if let (false, Some(team)) = (admin, &g.admin_team) {
         admin = on_team(team.clone()).await?;
     }
+    let name = format!("github/{login}");
     if admin {
-        return Ok((login, Ok(Role::Admin)));
+        return Ok((login, Ok(Caller::admin(&name))));
     }
-    if let Some(team) = &g.team {
-        if !on_team(team.clone()).await? {
-            return Ok((login, Err(Refused::NotOnTeam)));
+    let mut subjects = vec![format!("github:{login}"), "github-org".to_string()];
+    for team in teams {
+        if on_team(team.clone()).await? {
+            subjects.push(format!("github-team:{team}"));
         }
     }
-    Ok((login, Ok(Role::Viewer)))
+    Ok((
+        login,
+        Ok(Caller {
+            name,
+            role: Role::Member,
+            subjects,
+        }),
+    ))
 }
 
 #[cfg(test)]
@@ -397,6 +425,7 @@ mod tests {
         url: String,
         http: reqwest::Client,
         gh: Arc<Fake>,
+        state: Arc<crate::State>,
         _dir: tempfile::TempDir,
     }
 
@@ -408,10 +437,6 @@ mod tests {
     }
 
     async fn rig(gh: Fake) -> Rig {
-        rig_with(gh, None).await
-    }
-
-    async fn rig_with(gh: Fake, team: Option<&str>) -> Rig {
         let gh = Arc::new(gh);
         let github = serve(fake(gh.clone())).await;
         let dir = tempfile::tempdir().unwrap();
@@ -425,10 +450,10 @@ mod tests {
                 client_secret: "shh".into(),
                 org: "beigesys".into(),
                 admin_team: Some("ops".into()),
-                team: team.map(Into::into),
                 url: github,
             }),
         );
+        let db = state.clone();
         let router = crate::router(state);
         tokio::spawn(async move { axum::serve(l, router).await });
         let http = reqwest::Client::builder()
@@ -439,6 +464,7 @@ mod tests {
             url,
             http,
             gh,
+            state: db,
             _dir: dir,
         }
     }
@@ -519,6 +545,15 @@ mod tests {
                 .unwrap()
         }
 
+        /// Sign in as `login` and return who the session says that is.
+        async fn caller_of(&self, login: &str) -> Caller {
+            let res = self.sign_in(login).await;
+            assert_eq!(location(&res), "/", "{login}");
+            let cookie = Self::session(&res);
+            let token = cookie.strip_prefix("via_session=").unwrap();
+            self.state.db.session_caller(token).unwrap().unwrap()
+        }
+
         async fn role_of(&self, login: &str) -> (String, String) {
             let res = self.sign_in(login).await;
             assert_eq!(location(&res), "/");
@@ -563,9 +598,10 @@ mod tests {
             r.role_of("opsy").await,
             ("github/opsy".into(), "admin".into())
         );
+        // Every member observes every fleet, as viewers did before grants.
         assert_eq!(
             r.role_of("plain").await,
-            ("github/plain".into(), "viewer".into())
+            ("github/plain".into(), "member".into())
         );
         // The secret went to GitHub with the redirect the app registered.
         let sent = r.gh.exchanged.lock().unwrap();
@@ -591,18 +627,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_team_limits_who_gets_in() {
-        let r = rig_with(org(), Some("line")).await;
-        assert_eq!(
-            r.role_of("liner").await,
-            ("github/liner".into(), "viewer".into())
+    async fn grants_decide_who_else_gets_in() {
+        use crate::access::Level;
+        let r = rig(org()).await;
+        let db = &r.state.db;
+        db.delete_grant("github-org", None).unwrap();
+        db.create_fleet("line-07").unwrap();
+        db.set_grant("github-team:line", Some("line-07"), Level::Developer)
+            .unwrap();
+        db.set_grant("github:plain", None, Level::Observer).unwrap();
+        // The team grant is found by asking GitHub about that team.
+        let liner = r.caller_of("liner").await;
+        assert!(liner.subjects.contains(&"github-team:line".to_string()));
+        let a = crate::access::Access::load(db, &liner).unwrap();
+        assert_eq!(a.level("line-07"), Some(Level::Developer));
+        assert!(
+            r.caller_of("plain")
+                .await
+                .subjects
+                .contains(&"github:plain".to_string())
         );
-        // Admins get in without being on the team.
+        // Admins need no grant.
         assert_eq!(r.role_of("owner").await.1, "admin");
         assert_eq!(r.role_of("opsy").await.1, "admin");
-        // Other members don't, and the team doesn't let outsiders in.
+        // A member nobody granted anything is turned away, and the grants
+        // let no outsider in.
+        db.delete_grant("github:plain", None).unwrap();
         for (login, code) in [
-            ("plain", "not_on_team"),
+            ("plain", "no_access"),
             ("invited", "not_member"),
             ("stranger", "not_member"),
         ] {
