@@ -244,13 +244,21 @@ fn http_url(ws: &str) -> Result<String> {
 }
 
 fn os_version() -> Option<String> {
-    let text = std::fs::read_to_string("/etc/os-release").ok()?;
-    text.lines()
-        .find_map(|l| {
-            l.strip_prefix("IMAGE_VERSION=")
-                .or_else(|| l.strip_prefix("VERSION_ID="))
-        })
-        .map(|v| v.trim_matches('"').to_string())
+    image_version(&std::fs::read_to_string("/etc/os-release").ok()?)
+}
+
+/// IMAGE_VERSION wherever it is in the file, else VERSION_ID. A distribution's
+/// os-release usually has VERSION_ID near the top and an image build adds
+/// IMAGE_VERSION after it, so taking whichever comes first would report the
+/// distribution's version, and an OS update would never look finished.
+fn image_version(os_release: &str) -> Option<String> {
+    let field = |key: &str| {
+        os_release
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim_matches('"').to_string())
+    };
+    field("IMAGE_VERSION=").or_else(|| field("VERSION_ID="))
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -284,5 +292,20 @@ mod tests {
             "http://10.0.2.2:8080"
         );
         assert!(http_url("https://x").is_err());
+    }
+
+    #[test]
+    fn the_image_version_wins_wherever_it_is() {
+        let ubuntu = "NAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nID=ubuntu\nIMAGE_VERSION=7\n";
+        assert_eq!(image_version(ubuntu).as_deref(), Some("7"));
+        assert_eq!(
+            image_version("IMAGE_VERSION=\"3\"\nVERSION_ID=1\n").as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            image_version("VERSION_ID=\"24.04\"\n").as_deref(),
+            Some("24.04")
+        );
+        assert_eq!(image_version("NAME=x\n"), None);
     }
 }
