@@ -162,6 +162,73 @@ claude mcp add --transport http via https://via.example.com/mcp \
 claude mcp add via-local -- sudo -E via mcp    # flashing, releases
 ```
 
+## Deploy from GitHub
+
+A repository can upload releases from GitHub Actions with no token stored in
+it: each run asks GitHub for a short-lived OIDC token made out to your server,
+and the server checks GitHub's signature, the repository and the ref.
+
+1. An admin adds the repository on the Access page, under "Publish from
+   GitHub", or with `add_publisher`: `owner/name`, the apps it may release, and
+   the refs it may release from (`refs/heads/via` and `refs/tags/v*` unless you
+   say otherwise; `*` matches anything). The page then shows the workflow file.
+2. Add it to the repository as `.github/workflows/via.yml`:
+
+   ```yaml
+   name: via
+   on:
+     push:
+       branches: [via]
+       tags: ["v*"]
+   permissions:
+     id-token: write
+     contents: read
+   jobs:
+     release:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@v4
+         - uses: beigesys/viaos/action@main
+           with:
+             server: https://via.example.com
+             app: web
+             arch: x86_64 aarch64
+   ```
+
+3. Push to `via`, or push a `v*` tag. The action downloads `via` from the
+   latest viaos release (`via-version: v<N>` pins one), sets up QEMU when it
+   builds for an architecture other than the runner's, and runs `via release`.
+   Inputs: `server`, `app`, `file` (default `compose.yaml`), `arch`,
+   `working-directory`. Its output `release` is the number it got.
+
+A run's token can upload releases of the repository's apps and do nothing
+else: not `/mcp`, not a deploy, not another app. `server` must be the server's
+`VIA_PUBLIC_URL` exactly, because that is who the token is made out to. The
+repository's numeric id is pinned the first time it publishes (or when you give
+`repository_id`), so a repository deleted and made again, or a renamed one
+whose old name someone else took, is refused until an admin adds it again.
+Pull requests from forks get no token. Each upload is audited as
+`github-actions:<owner/name>@<ref>`.
+
+Without `--release`, `via release` asks the server for the next number, one
+more than the highest the app has. Every ask gets a new number, so re-running a
+workflow makes a new release and never meets the old one, and numbers made by
+hand and by CI share one count. A build that fails after asking leaves a gap.
+Elsewhere than GitHub, `VIA_TOKEN` still works, in the action too.
+
+### Following
+
+A fleet can follow an app: each release uploaded from then on is deployed to
+its devices, and those of the fleets under it, as each architecture's build
+arrives. Set it on the fleet's Releases tab under "Deploy new releases", or
+with `follow_app`; it needs developer on the fleet. It is the same deploy a
+person starts, held to the health gate and rolled back on the device if it
+fails. A device that was offline, or joins the fleet later, gets the newest
+such release when it connects. Each device is sent a release once:
+one that failed its gate isn't sent it again, and one someone deployed an older
+release to by hand keeps it until the next. Every deploy is in the audit log as
+`auto_deploy`.
+
 ## Variables and secrets
 
 A release holds no secrets. In the compose file, a bare name says a service
@@ -276,8 +343,10 @@ roles grants `github-org` observer on every fleet, which is what members could d
 before; remove that grant to let in only the people and teams you name.
 
 Still an admin's alone: tokens, grants, the audit log, device types, OS updates
-and base images, and fleets at the top level. Uploading an app release needs
-developer on some fleet, since apps aren't any one fleet's.
+and base images, fleets at the top level, and which repositories publish from
+GitHub. Uploading an app release needs developer on some fleet, since apps
+aren't any one fleet's, or a GitHub Actions run of a repository that publishes
+the app (see [Deploy from GitHub](#deploy-from-github)).
 
 `via-server token create ci --role developer --fleet line-07` makes a token
 with a role on one fleet; leave out `--fleet` for every fleet.

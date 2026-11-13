@@ -24,6 +24,8 @@ use crate::access::{Access, Level};
 use crate::db::Caller;
 use crate::image;
 
+mod publishing;
+
 tokio::task_local! {
     /// Who the tool call in progress is for.
     static CALLER: Caller;
@@ -42,6 +44,9 @@ const ADMIN_TOOLS: &[&str] = &[
     "delete_grant",
     "set_device_type",
     "delete_device_type",
+    "list_publishers",
+    "add_publisher",
+    "remove_publisher",
 ];
 
 const INSTRUCTIONS: &str = "\
@@ -327,7 +332,7 @@ impl Fleet {
     pub fn new(state: Arc<State>) -> Self {
         Self {
             state,
-            tool_router: Self::tool_router(),
+            tool_router: Self::tool_router() + Self::publishing_router(),
         }
     }
 

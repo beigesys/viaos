@@ -200,7 +200,7 @@ fn normalize_reference(r: &str) -> String {
     }
 }
 
-fn default_app_name(compose_path: &Path) -> Result<String> {
+pub fn default_app_name(compose_path: &Path) -> Result<String> {
     let dir = compose_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

@@ -4,6 +4,7 @@ import { ago, authOptions, tool, type Level } from "../lib";
 import { useIsAdmin, useMe } from "../main";
 import { Button, Combobox, Copy, Empty, Failure, Field, Headline, Input, Section } from "../ui";
 import { useFleets } from "./fleet";
+import { Publishers } from "./publishing";
 
 type Token = { name: string; role: string; created_at: number; last_used: number | null };
 type Grant = { subject: string; fleet: string | null; level: Level };
@@ -242,6 +243,7 @@ export function Access() {
           </Section>
         </div>
       </div>
+      {admin && <Publishers />}
     </>
   );
 }

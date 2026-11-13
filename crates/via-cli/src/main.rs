@@ -47,9 +47,10 @@ enum Command {
         /// Application name. Defaults to the compose file's directory name.
         #[arg(short, long)]
         app: Option<String>,
-        /// Release number. Releases are immutable; use a new number each time.
+        /// Release number. Releases are immutable. Omit to take the next
+        /// number from the server.
         #[arg(short, long)]
-        release: u64,
+        release: Option<u64>,
         /// Architectures to build for.
         #[arg(long, default_value = "x86_64")]
         arch: Vec<String>,
@@ -60,6 +61,10 @@ enum Command {
         /// Without one it goes out unsigned.
         #[arg(long, env = "VIA_SIGNING_KEY")]
         sign_key: Option<PathBuf>,
+        /// Sign in with the GitHub Actions run's OIDC token rather than
+        /// VIA_TOKEN. In GitHub Actions with no VIA_TOKEN, this is the default.
+        #[arg(long)]
+        github_oidc: bool,
     },
     /// Make a signing key for OS updates and app releases.
     Keygen {
@@ -125,9 +130,10 @@ struct ReleaseArgs {
     /// Application name. Defaults to the compose file's directory name.
     #[serde(default)]
     app: Option<String>,
-    /// Release number. Releases are immutable: use the next unused number,
-    /// which `list_releases` on the control plane shows.
-    release: u64,
+    /// Release number. Releases are immutable. Omit to take the next number
+    /// from the control plane.
+    #[serde(default)]
+    release: Option<u64>,
     /// Architectures to build for: `x86_64` and/or `aarch64`. Build for every
     /// architecture the fleet has. Defaults to x86_64.
     #[serde(default)]
@@ -141,12 +147,29 @@ struct ReleaseArgs {
 fn release(
     file: PathBuf,
     app: Option<String>,
-    number: u64,
+    number: Option<u64>,
     archs: Vec<String>,
     no_build: bool,
     sign_key: Option<PathBuf>,
+    github_oidc: bool,
 ) -> Result<Value> {
-    let remote = remote::Remote::from_env()?;
+    let remote = if github_oidc {
+        remote::Remote::github_oidc()?
+    } else {
+        remote::Remote::from_env()?
+    };
+    let number = match number {
+        Some(n) => n,
+        None => {
+            let app = match &app {
+                Some(a) => a.clone(),
+                None => build::default_app_name(&file)?,
+            };
+            let n = remote.next_release(&app)?;
+            eprintln!("{app} release {n}");
+            n
+        }
+    };
     let archs = if archs.is_empty() {
         vec!["x86_64".to_string()]
     } else {
@@ -285,6 +308,7 @@ impl Local {
                 a.archs,
                 a.no_build,
                 key,
+                false,
             )
         })
         .await
@@ -337,6 +361,7 @@ async fn main() -> Result<()> {
             arch,
             no_build,
             sign_key,
+            github_oidc,
         } => {
             let r = tokio::task::spawn_blocking(move || {
                 release(
@@ -346,6 +371,7 @@ async fn main() -> Result<()> {
                     arch,
                     no_build,
                     keys::signing_key(sign_key)?,
+                    github_oidc,
                 )
             })
             .await??;

@@ -12,7 +12,9 @@
 //! - `PUT  /v1/os/{arch}/{version}/{file}`  upload OS update files (admin)
 //! - `PUT  /v1/base/{name}`   upload the base image provisioning starts from, for a
 //!   device type or a whole architecture (admin)
-//! - `PUT  /v1/releases/{app}/{release}/{arch}`  upload a bundle (admin)
+//! - `PUT  /v1/releases/{app}/{release}/{arch}`  upload a bundle (developer, or
+//!   a GitHub Actions run of a publisher; see `publish`)
+//! - `POST /v1/releases/{app}`  take the next release number
 //! - `GET  /v1/releases/{app}/{release}/{arch}`  fetch a bundle (devices)
 //! - `GET  /v1/devices/{device}/tunnel/{port}`  a TCP stream to a port on a
 //!   device, over its connection (WebSocket, admin)
@@ -25,17 +27,22 @@
 //! fleet (see `access`).
 
 mod access;
+#[cfg(test)]
+mod ci_tests;
 mod db;
 mod fetch;
+mod follow;
 mod github;
 mod hub;
 mod image;
 mod limit;
 mod mcp;
 mod oauth;
+mod oidc;
 mod os;
 mod os_track;
 mod provisioning;
+mod publish;
 mod releases;
 mod secrets;
 mod web;
@@ -207,6 +214,8 @@ pub struct State {
     pub secrets: secrets::Secrets,
     pub github: Option<github::Config>,
     pub limiter: limit::Limiter,
+    /// Checks GitHub Actions' tokens, for publishing releases.
+    pub oidc: oidc::Verifier,
 }
 
 impl State {
@@ -343,6 +352,7 @@ async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
         secrets,
         github,
         limiter: limit::Limiter::new(cli.trust_proxy),
+        oidc: oidc::Verifier::github(),
     });
     tokio::spawn(os_track::run(state.clone()));
     tokio::spawn(oauth::tidy(state.clone()));
@@ -371,6 +381,7 @@ fn router(state: Arc<State>) -> Router {
             "/v1/releases/{app}/{release}/{arch}",
             axum::routing::put(upload_release),
         )
+        .route("/v1/releases/{app}", post(publish::reserve))
         .route("/v1/devices/{device}/tunnel/{port}", get(tunnel))
         .route("/v1/devices/{device}/shell", get(shell))
         .with_state(state.clone())
@@ -457,6 +468,7 @@ fn test_state(
         secrets: secrets::Secrets::open(dir, None).unwrap(),
         github,
         limiter: limit::Limiter::new(0),
+        oidc: oidc::Verifier::github(),
     })
 }
 
@@ -491,6 +503,10 @@ async fn require_caller(AxState(s): AxState<Arc<State>>, mut req: Request, next:
     // counts from our own pages.
     if by_cookie && !same_origin(req.headers()) {
         return (StatusCode::FORBIDDEN, "cross-origin request").into_response();
+    }
+    if !by_cookie && oidc::looks_like_jwt(token) {
+        let token = token.to_string();
+        return publish::authenticate(&s, req, next, &token).await;
     }
     let caller = if s.admin_token_hash.as_deref() == Some(db::hash(token).as_str()) {
         Some(db::Caller::admin("admin"))
@@ -636,10 +652,11 @@ async fn connect(
             let (s, device) = (s.clone(), device.clone());
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                if let Ok(Some(d)) = s.db.device(&device)
-                    && let Err(e) = secrets::push(&s, &d).await
-                {
-                    tracing::warn!(device = %d.name, "sending variables failed: {e:#}");
+                if let Ok(Some(d)) = s.db.device(&device) {
+                    if let Err(e) = secrets::push(&s, &d).await {
+                        tracing::warn!(device = %d.name, "sending variables failed: {e:#}");
+                    }
+                    follow::catch_up(&s, &d).await;
                 }
             })
         };
@@ -707,15 +724,12 @@ fn uploaded(result: Result<serde_json::Value>) -> Response {
 async fn upload_release(
     AxState(s): AxState<Arc<State>>,
     Extension(caller): Extension<db::Caller>,
+    publishing: Option<Extension<publish::Publishing>>,
     Path((app, release, arch)): Path<(String, u64, String)>,
     body: Body,
 ) -> Response {
     let result = async {
-        // Apps aren't any fleet's, so whoever deploys to some fleet may add one.
-        anyhow::ensure!(
-            access::Access::load(&s.db, &caller)?.anywhere(access::Level::Developer),
-            "uploading a release needs developer on some fleet"
-        );
+        publish::may_release(&s, &caller, publishing.as_deref(), &app)?;
         let path = releases::bundle_path(&s.releases_dir(), &app, release, &arch)?;
         anyhow::ensure!(
             !path.exists(),
@@ -734,7 +748,8 @@ async fn upload_release(
         if let Err(e) = recorded {
             tracing::warn!(%app, release, %arch, "reading its variables failed: {e:#}");
         }
-        Ok(json!({ "app": app, "release": release, "arch": arch, "sha256": digest }))
+        let deployed = follow::released(&s, &caller.name, &app, release, &arch).await;
+        Ok(json!({ "app": app, "release": release, "arch": arch, "sha256": digest, "auto_deploy": deployed }))
     }
     .await;
     s.db.audit(

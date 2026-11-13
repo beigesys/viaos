@@ -1,0 +1,96 @@
+# Build a compose app and upload it to a viaos control plane as a new release,
+# signed in with the run's GitHub OIDC token: nothing is stored in the
+# repository. An admin must first add the repository as a publisher (the
+# console's Access page, or `add_publisher`). See docs/deploy.md, "Deploy from
+# GitHub".
+#
+# The job needs `permissions: id-token: write`.
+name: viaos release
+description: Build a compose app and upload it to a viaos control plane as a new release.
+branding:
+  icon: upload-cloud
+  color: gray-dark
+
+inputs:
+  server:
+    description: The control plane's address, e.g. https://via.example.com. Tokens are made for it.
+    required: true
+  app:
+    description: Application name. Defaults to the compose file's directory name.
+    required: false
+    default: ""
+  file:
+    description: Compose file, relative to working-directory.
+    required: false
+    default: compose.yaml
+  arch:
+    description: Architectures to build for, space-separated, x86_64 and/or aarch64.
+    required: false
+    default: x86_64
+  working-directory:
+    description: Where the compose project is.
+    required: false
+    default: .
+  via-version:
+    description: The viaos release whose `via` to use, e.g. v3. Defaults to the latest.
+    required: false
+    default: ""
+  via-repository:
+    description: Where to download `via` from.
+    required: false
+    default: beigesys/viaos
+
+outputs:
+  release:
+    description: The release number the server gave.
+    value: ${{ steps.release.outputs.release }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install via
+      id: install
+      shell: bash
+      env:
+        REPO: ${{ inputs.via-repository }}
+        VERSION: ${{ inputs.via-version }}
+        ARCHS: ${{ inputs.arch }}
+      run: |
+        set -euo pipefail
+        case "$(uname -m)" in
+          x86_64) host=x86_64 ;;
+          aarch64 | arm64) host=aarch64 ;;
+          *) echo "::error::via runs on x86_64 or aarch64 Linux, not $(uname -m)"; exit 1 ;;
+        esac
+        if [ -n "$VERSION" ]; then
+          url="https://github.com/$REPO/releases/download/$VERSION/via-$host"
+        else
+          url="https://github.com/$REPO/releases/latest/download/via-$host"
+        fi
+        mkdir -p "$RUNNER_TEMP/via-bin"
+        curl -fsSL --retry 3 -o "$RUNNER_TEMP/via-bin/via" "$url"
+        chmod +x "$RUNNER_TEMP/via-bin/via"
+        echo "$RUNNER_TEMP/via-bin" >> "$GITHUB_PATH"
+        # Building for another architecture runs its binaries under QEMU.
+        foreign=false
+        for a in $ARCHS; do [ "$a" = "$host" ] || foreign=true; done
+        echo "foreign=$foreign" >> "$GITHUB_OUTPUT"
+    - if: steps.install.outputs.foreign == 'true'
+      uses: docker/setup-qemu-action@v3
+    - name: Release
+      id: release
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        VIA_SERVER: ${{ inputs.server }}
+        APP: ${{ inputs.app }}
+        FILE: ${{ inputs.file }}
+        ARCHS: ${{ inputs.arch }}
+      run: |
+        set -euo pipefail
+        # With no VIA_TOKEN in the environment, via uses the run's OIDC token.
+        args=(release --file "$FILE")
+        [ -z "$APP" ] || args+=(--app "$APP")
+        for a in $ARCHS; do args+=(--arch "$a"); done
+        via "${args[@]}" | tee "$RUNNER_TEMP/via-release.json"
+        echo "release=$(jq -r .release "$RUNNER_TEMP/via-release.json")" >> "$GITHUB_OUTPUT"

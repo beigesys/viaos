@@ -6,6 +6,7 @@ import { useIsAdmin } from "../main";
 import { Button, buttonClass, Combobox, Empty, Failure, Field, Headline, Input, Modal, Pip, Readout, Section, Tag, Textarea } from "../ui";
 import { useRunning } from "./catalog";
 import { EnrollTab } from "./enroll";
+import { Following } from "./publishing";
 import { Deployables } from "./releases";
 import { ScopeVariables } from "./variables";
 
@@ -436,7 +437,12 @@ function DeviceTable({ devices, all, showFleet }: { devices: Device[]; all?: Fle
 
 function FleetReleases({ fleet, tree, devices }: { fleet: string; tree: string[]; devices: Device[] }) {
   const running = useRunning().filter((r) => tree.includes(r.device.fleet));
-  return <Deployables target={{ fleet }} base={fleetPath(fleet)} label={fleet} running={running} runningOs={devices.flatMap((d) => d.os_version ?? [])} />;
+  return (
+    <>
+      <Following fleet={fleet} />
+      <Deployables target={{ fleet }} base={fleetPath(fleet)} label={fleet} running={running} runningOs={devices.flatMap((d) => d.os_version ?? [])} />
+    </>
+  );
 }
 
 /** One fleet: its devices, what it runs, its settings, and how devices join it. */

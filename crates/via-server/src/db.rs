@@ -297,7 +297,7 @@ pub struct ApiToken {
 }
 
 pub struct Db {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -468,6 +468,8 @@ impl Db {
             )?;
         }
         conn.execute_batch(VARIABLES_IDENTITY)?;
+        conn.execute_batch(crate::publish::SCHEMA)?;
+        conn.execute_batch(crate::follow::SCHEMA)?;
         lowercase_fleets(&conn)?;
         let has_grants = conn
             .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'grants'")?

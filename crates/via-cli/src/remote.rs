@@ -2,7 +2,10 @@
 //! signing, and TCP tunnels into devices.
 //!
 //! `VIA_SERVER` is the control plane's URL and `VIA_TOKEN` an API token from
-//! `via-server token create` (`VIA_ADMIN_TOKEN` is accepted too).
+//! `via-server token create` (`VIA_ADMIN_TOKEN` is accepted too). In GitHub
+//! Actions with no token set, the run's own OIDC token is used instead, which
+//! the server accepts for uploading releases of the apps the repository
+//! publishes.
 
 use std::path::{Path, PathBuf};
 
@@ -15,22 +18,120 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use via_bundle::SigningKey;
 
+/// Percent-encode everything but the characters a URL never needs escaped.
+fn escape(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+fn server() -> Result<String> {
+    let server = std::env::var("VIA_SERVER").context("set VIA_SERVER to the control plane URL")?;
+    Ok(server.trim_end_matches('/').to_string())
+}
+
 pub struct Remote {
     server: String,
-    token: String,
+    auth: Auth,
+}
+
+enum Auth {
+    Token(String),
+    /// Asked for afresh before each request: GitHub's tokens last minutes,
+    /// and a multi-arch build can take longer.
+    GithubOidc {
+        url: String,
+        token: String,
+    },
 }
 
 impl Remote {
     pub fn from_env() -> Result<Self> {
-        let server =
-            std::env::var("VIA_SERVER").context("set VIA_SERVER to the control plane URL")?;
-        let token = std::env::var("VIA_TOKEN")
-            .or_else(|_| std::env::var("VIA_ADMIN_TOKEN"))
-            .context("set VIA_TOKEN to an API token from `via-server token create`")?;
+        let server = server()?;
+        match std::env::var("VIA_TOKEN").or_else(|_| std::env::var("VIA_ADMIN_TOKEN")) {
+            Ok(token) => Ok(Self {
+                server,
+                auth: Auth::Token(token),
+            }),
+            Err(_) if std::env::var_os("ACTIONS_ID_TOKEN_REQUEST_URL").is_some() => {
+                Self::github_oidc()
+            }
+            Err(_) => bail!("set VIA_TOKEN to an API token from `via-server token create`"),
+        }
+    }
+
+    /// Authenticate with the GitHub Actions run's OIDC token, made for
+    /// `VIA_SERVER`. The workflow needs `permissions: id-token: write`.
+    pub fn github_oidc() -> Result<Self> {
+        let var = |name: &str| {
+            std::env::var(name).with_context(|| {
+                format!("{name} is not set: this needs GitHub Actions with `permissions: id-token: write`")
+            })
+        };
         Ok(Self {
-            server: server.trim_end_matches('/').to_string(),
-            token,
+            server: server()?,
+            auth: Auth::GithubOidc {
+                url: var("ACTIONS_ID_TOKEN_REQUEST_URL")?,
+                token: var("ACTIONS_ID_TOKEN_REQUEST_TOKEN")?,
+            },
         })
+    }
+
+    /// What to send as the bearer token. Blocking.
+    fn bearer(&self) -> Result<String> {
+        match &self.auth {
+            Auth::Token(t) => Ok(t.clone()),
+            Auth::GithubOidc { url, token } => {
+                #[derive(serde::Deserialize)]
+                struct Issued {
+                    value: String,
+                }
+                let sep = if url.contains('?') { '&' } else { '?' };
+                let resp = reqwest::blocking::Client::new()
+                    .get(format!("{url}{sep}audience={}", escape(&self.server)))
+                    .bearer_auth(token)
+                    .send()
+                    .context("asking GitHub for an OIDC token")?;
+                let status = resp.status();
+                if !status.is_success() {
+                    bail!("asking GitHub for an OIDC token: {status}");
+                }
+                Ok(resp.json::<Issued>()?.value)
+            }
+        }
+    }
+
+    /// The API token, for what only a person's token can do.
+    fn token(&self) -> Result<&str> {
+        match &self.auth {
+            Auth::Token(t) => Ok(t),
+            Auth::GithubOidc { .. } => {
+                bail!("a GitHub Actions token can only upload releases; set VIA_TOKEN")
+            }
+        }
+    }
+
+    /// Take the next release number of `app` from the server. Each call
+    /// gets a new one, so a build that is run again never meets an old one.
+    pub fn next_release(&self, app: &str) -> Result<u64> {
+        let resp = reqwest::blocking::Client::new()
+            .post(format!("{}/v1/releases/{app}", self.server))
+            .bearer_auth(self.bearer()?)
+            .send()?;
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            bail!("taking a release number for {app}: {status} {text}");
+        }
+        let v: Value = serde_json::from_str(&text)?;
+        v["release"]
+            .as_u64()
+            .context("the server gave no release number")
     }
 
     /// PUT a file to `path` on the control plane and return its JSON reply.
@@ -41,7 +142,7 @@ impl Remote {
             .timeout(None)
             .build()?
             .put(format!("{}{path}", self.server))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.bearer()?)
             .body(body)
             .send()?;
         let status = resp.status();
@@ -76,7 +177,7 @@ impl Remote {
             .into_client_request()?;
         req.headers_mut().insert(
             "authorization",
-            HeaderValue::from_str(&format!("Bearer {}", self.token))?,
+            HeaderValue::from_str(&format!("Bearer {}", self.token()?))?,
         );
         let (ws, _) = tokio_tungstenite::connect_async(req)
             .await
@@ -230,4 +331,61 @@ pub fn base_image(
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(&signed);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader, Write};
+
+    use super::*;
+
+    /// GitHub's token endpoint, for one request: answers with a token and
+    /// says what it was asked.
+    fn github(reply: &'static str) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/token?api-version=2.0", l.local_addr().unwrap());
+        let seen = std::thread::spawn(move || {
+            let (mut conn, _) = l.accept().unwrap();
+            let mut lines = Vec::new();
+            for line in BufReader::new(conn.try_clone().unwrap()).lines() {
+                let line = line.unwrap();
+                if line.is_empty() {
+                    break;
+                }
+                lines.push(line);
+            }
+            write!(
+                conn,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{reply}",
+                reply.len()
+            )
+            .unwrap();
+            lines
+        });
+        (url, seen)
+    }
+
+    #[test]
+    fn a_run_asks_github_for_a_token_for_this_server() {
+        let (url, seen) = github(r#"{"count":1,"value":"eyJ.a.b"}"#);
+        let remote = Remote {
+            server: "https://via.example.com".into(),
+            auth: Auth::GithubOidc {
+                url,
+                token: "request-token".into(),
+            },
+        };
+        assert_eq!(remote.bearer().unwrap(), "eyJ.a.b");
+        let seen = seen.join().unwrap();
+        assert_eq!(
+            seen[0],
+            "GET /token?api-version=2.0&audience=https%3A%2F%2Fvia.example.com HTTP/1.1"
+        );
+        assert!(
+            seen.iter()
+                .any(|h| h.eq_ignore_ascii_case("authorization: Bearer request-token"))
+        );
+        // Not for anything else.
+        assert!(remote.token().is_err());
+    }
 }
