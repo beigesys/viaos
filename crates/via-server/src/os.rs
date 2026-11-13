@@ -1,5 +1,9 @@
-//! OS versions available to devices: `<os_dir>/<arch>/<version>/`, each the
-//! output of `nix build .#updates.<arch>`.
+//! OS versions available to devices: `<os_dir>/<platform>/<version>/`, each
+//! the output of `nix build .#updates.<platform>`.
+//!
+//! A platform is an architecture, `x86_64`, or an architecture and a variant
+//! of viaos built for it, `x86_64-nvidia`. Each is its own line of versions: a
+//! device updates only within the one it runs.
 
 use std::path::{Path, PathBuf};
 
@@ -9,6 +13,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize)]
 pub struct Release {
     pub arch: String,
+    /// E.g. `nvidia`; empty for the plain OS.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub variant: String,
     pub version: String,
     #[serde(skip)]
     pub dir: PathBuf,
@@ -20,6 +27,8 @@ pub struct Release {
 struct Manifest {
     version: String,
     arch: String,
+    #[serde(default)]
+    variant: String,
     files: Vec<ManifestFile>,
     #[serde(default)]
     secure_boot: bool,
@@ -33,6 +42,21 @@ struct ManifestFile {
     sha256: Option<String>,
 }
 
+/// Where a device running `variant` of viaos on `arch` gets its updates.
+pub fn platform(arch: &str, variant: &str) -> String {
+    if variant.is_empty() {
+        arch.to_string()
+    } else {
+        format!("{arch}-{variant}")
+    }
+}
+
+impl Manifest {
+    fn platform(&self) -> String {
+        platform(&self.arch, &self.variant)
+    }
+}
+
 fn safe(part: &str) -> bool {
     !part.is_empty()
         && part
@@ -41,24 +65,25 @@ fn safe(part: &str) -> bool {
         && !part.starts_with('.')
 }
 
-pub fn find(os_dir: &Path, arch: &str, version: &str) -> Result<Release> {
-    if !safe(arch) || !safe(version) {
-        bail!("bad arch or version");
+pub fn find(os_dir: &Path, platform: &str, version: &str) -> Result<Release> {
+    if !safe(platform) || !safe(version) {
+        bail!("bad platform or version");
     }
-    let dir = os_dir.join(arch).join(version);
+    let dir = os_dir.join(platform).join(version);
     let text = std::fs::read_to_string(dir.join("manifest.json")).with_context(|| {
-        format!("no OS version {version} for {arch}; `list_os_versions` shows them")
+        format!("no OS version {version} for {platform}; `list_os_versions` shows them")
     })?;
     let m: Manifest = serde_json::from_str(&text).context("reading manifest.json")?;
-    if m.version != version || m.arch != arch {
+    if m.version != version || m.platform() != platform {
         bail!(
-            "{} holds {} for {}, not {version} for {arch}",
+            "{} holds {} for {}, not {version} for {platform}",
             dir.display(),
             m.version,
-            m.arch
+            m.platform()
         );
     }
     Ok(Release {
+        variant: m.variant.clone(),
         arch: m.arch,
         version: m.version,
         size_mb: m.files.iter().map(|f| f.size).sum::<u64>() / 1_048_576,
@@ -82,14 +107,14 @@ pub fn upload_dir(os_dir: &Path, arch: &str, version: &str, file: &str) -> Resul
 }
 
 /// Check a staged manifest against the files uploaded beside it.
-pub fn check_complete(dir: &Path, manifest: &Path, arch: &str, version: &str) -> Result<()> {
+pub fn check_complete(dir: &Path, manifest: &Path, platform: &str, version: &str) -> Result<()> {
     let m: Manifest =
         serde_json::from_slice(&std::fs::read(manifest)?).context("manifest.json is not valid")?;
-    if m.version != version || m.arch != arch {
+    if m.version != version || m.platform() != platform {
         bail!(
-            "manifest is for {} on {}, uploaded as {version} on {arch}",
+            "manifest is for {} on {}, uploaded as {version} on {platform}",
             m.version,
-            m.arch
+            m.platform()
         );
     }
     // So there's no such thing here as a version some devices would refuse.
@@ -111,12 +136,12 @@ pub fn check_complete(dir: &Path, manifest: &Path, arch: &str, version: &str) ->
     Ok(())
 }
 
-/// What a version is on each architecture it was published for.
+/// What a version is on each platform it was published for.
 pub fn details(os_dir: &Path, version: &str) -> Result<serde_json::Value> {
     use serde_json::json;
     let mut builds = Vec::new();
-    for arch in read_names(os_dir) {
-        let Ok(r) = find(os_dir, &arch, version) else {
+    for platform in read_names(os_dir) {
+        let Ok(r) = find(os_dir, &platform, version) else {
             continue;
         };
         let path = r.dir.join("manifest.json");
@@ -130,7 +155,7 @@ pub fn details(os_dir: &Path, version: &str) -> Result<serde_json::Value> {
             .iter()
             .map(|f| json!({ "name": f.name, "size_mb": f.size / 1_048_576, "sha256": f.sha256 }))
             .collect();
-        builds.push(json!({ "arch": arch, "published_at": published_at, "size_mb": r.size_mb, "files": files }));
+        builds.push(json!({ "arch": r.arch, "variant": r.variant, "published_at": published_at, "size_mb": r.size_mb, "files": files }));
     }
     anyhow::ensure!(
         !builds.is_empty(),
@@ -162,9 +187,9 @@ pub fn check_signature(dir: &Path, manifest: &Path, trusted: &[String]) -> Resul
 
 pub fn list(os_dir: &Path) -> Vec<Release> {
     let mut out = Vec::new();
-    for arch in read_names(os_dir) {
-        for version in read_names(&os_dir.join(&arch)) {
-            if let Ok(r) = find(os_dir, &arch, &version) {
+    for platform in read_names(os_dir) {
+        for version in read_names(&os_dir.join(&platform)) {
+            if let Ok(r) = find(os_dir, &platform, &version) {
                 out.push(r);
             }
         }
@@ -245,6 +270,39 @@ mod tests {
 
         std::fs::remove_file(&sig_path).unwrap();
         check_signature(d.path(), &m, &[]).unwrap();
+    }
+
+    #[test]
+    fn a_variant_is_its_own_line_of_versions() {
+        let d = tempfile::tempdir().unwrap();
+        let publish = |platform: &str, variant: Option<&str>| {
+            let dir = d.path().join(platform).join("2");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut m = serde_json::json!({
+                "version": "2", "arch": "x86_64", "files": [{ "name": "a.efi", "size": 3 }],
+            });
+            if let Some(v) = variant {
+                m["variant"] = v.into();
+            }
+            std::fs::write(dir.join("manifest.json"), m.to_string()).unwrap();
+        };
+        publish("x86_64-nvidia", Some("nvidia"));
+        assert_eq!(
+            find(d.path(), &platform("x86_64", "nvidia"), "2")
+                .unwrap()
+                .variant,
+            "nvidia"
+        );
+        // A plain device finds nothing to install, not the NVIDIA build.
+        assert!(find(d.path(), &platform("x86_64", ""), "2").is_err());
+        publish("x86_64", None);
+        assert_eq!(find(d.path(), "x86_64", "2").unwrap().variant, "");
+        // A variant's manifest under the plain name is refused, and the other
+        // way round.
+        publish("x86_64", Some("nvidia"));
+        assert!(find(d.path(), "x86_64", "2").is_err());
+        publish("x86_64-nvidia", None);
+        assert!(find(d.path(), "x86_64-nvidia", "2").is_err());
     }
 
     #[test]

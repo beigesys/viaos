@@ -566,7 +566,9 @@ impl Fleet {
         }))
     }
 
-    /// Every targeted device, with what will happen to it and why.
+    /// Every targeted device, with what will happen to it and why. A device
+    /// gets only builds of the variant it runs: the NVIDIA one never the plain
+    /// one, nor the other way round.
     async fn update_os(&self, a: &UpdateOsArgs) -> anyhow::Result<Value> {
         let s = &self.state;
         let devices = self.targets(&a.fleet, &a.device)?;
@@ -579,17 +581,17 @@ impl Fleet {
                     if d.os_version.as_deref() == Some(a.version.as_str()) {
                         return Some("already on this version".to_string());
                     }
-                    crate::os::find(&s.os_dir, d.arch.as_deref().unwrap_or_default(), &a.version)
+                    crate::os::find(&s.os_dir, &os_platform(d), &a.version)
                         .err()
                         .map(|e| format!("{e:#}"))
                 },
                 |d| {
-                    let arch = d.arch.clone().unwrap_or_default();
+                    let platform = os_platform(d);
                     let mut args = JsonObject::new();
                     args.insert("version".into(), json!(a.version));
                     args.insert(
                         "source".into(),
-                        json!(format!("{}/v1/os/{arch}/{}", s.public_url, a.version)),
+                        json!(format!("{}/v1/os/{platform}/{}", s.public_url, a.version)),
                     );
                     ("os_update", args)
                 },
@@ -640,7 +642,10 @@ impl Fleet {
         let types = s.db.device_types()?;
         let device_type = match (&a.device_type, &a.arch) {
             (Some(id), _) => types.iter().find(|t| &t.id == id),
-            (None, Some(arch)) => types.iter().find(|t| &t.arch == arch),
+            // An architecture alone means its plain OS, not a variant.
+            (None, Some(arch)) => types
+                .iter()
+                .find(|t| &t.arch == arch && image::shares_arch_image(t)),
             (None, None) => anyhow::bail!("say which device_type this image is for"),
         }
         .ok_or_else(|| {
@@ -678,6 +683,11 @@ impl Fleet {
             30 * 24 * 3600,
             &id,
         )?;
+        // Until it connects and says so itself, it runs what its image does.
+        let variant = image::variant(device_type);
+        if !variant.is_empty() {
+            s.db.set_variant(&device.id, variant)?;
+        }
         match self.write_image(a, device_type, &base, &device, &token, &settings) {
             Ok(v) => Ok(v),
             Err(e) => {
@@ -1506,9 +1516,10 @@ impl Fleet {
 
     #[tool(
         name = "list_os_versions",
-        description = "OS versions the control plane can install, per architecture, with \
-                       download size. Compare with each device's os_version from \
-                       `list_devices`. Reads only.",
+        description = "OS versions the control plane can install, per architecture and \
+                       variant (e.g. `nvidia`; none is the plain OS), with download size. \
+                       Compare with each device's os_version and variant from `list_devices`: \
+                       a device installs only builds of its own variant. Reads only.",
         annotations(
             title = "List OS versions",
             read_only_hint = true,
@@ -2273,6 +2284,11 @@ fn inherited(fleets: &[crate::db::Fleet], fleet: &str) -> Vec<String> {
     tags
 }
 
+/// The OS builds a device takes updates from; see [`crate::os::platform`].
+fn os_platform(d: &crate::db::Device) -> String {
+    crate::os::platform(d.arch.as_deref().unwrap_or_default(), &d.variant)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2897,6 +2913,51 @@ mod tests {
             .refused(&dev, "delete_device", json!({ "device": "press-2" }))
             .await;
         assert!(e.contains("only a device waiting"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_waiting_nvidia_device_is_on_the_nvidia_variant() {
+        let r = rig().await;
+        base_image(&r.state.images_dir.join("viaos-x86_64.raw"));
+        let dev = r.token("dev", Some(Level::Developer), Some("line-07"));
+        // Only the type's own image will do, never the plain one.
+        let e = r
+            .refused(
+                &dev,
+                "create_provisioning_image",
+                json!({ "fleet": "line-07", "device_type": "pc-nvidia", "title": "Vision" }),
+            )
+            .await;
+        assert!(e.contains("pc-nvidia"), "{e}");
+        base_image(&r.state.images_dir.join("viaos-pc-nvidia.raw"));
+        r.call(
+            &dev,
+            "create_provisioning_image",
+            json!({ "fleet": "line-07", "device_type": "pc-nvidia", "title": "Vision" }),
+        )
+        .await
+        .unwrap();
+        // An architecture alone is the plain OS.
+        r.call(
+            &dev,
+            "create_provisioning_image",
+            json!({ "fleet": "line-07", "arch": "x86_64", "title": "Plain" }),
+        )
+        .await
+        .unwrap();
+        let listed = r.call(&dev, "list_devices", json!({})).await.unwrap();
+        let find = |name: &str| {
+            listed["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(find("vision")["waiting"], true);
+        assert_eq!(find("vision")["variant"], "nvidia", "{listed}");
+        assert!(find("plain")["variant"].is_null(), "{listed}");
     }
 
     const PASS: &str = "line-seven-wifi-pass";

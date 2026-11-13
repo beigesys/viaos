@@ -8,7 +8,8 @@
 //! - `POST /v1/enroll`        a device spends its enrollment token
 //! - `GET  /v1/connect`       a device's management connection (WebSocket)
 //! - `GET  /v1/images/{id}`   download a provisioning image
-//! - `GET  /v1/os/{arch}/{version}/{file}`  OS update files, for devices
+//! - `GET  /v1/os/{arch}/{version}/{file}`  OS update files, for devices; `arch`
+//!   is `<arch>-<variant>` for a variant such as `x86_64-nvidia`
 //! - `PUT  /v1/os/{arch}/{version}/{file}`  upload OS update files (admin)
 //! - `PUT  /v1/base/{name}`   upload the base image provisioning starts from, for a
 //!   device type or a whole architecture (admin)
@@ -628,6 +629,8 @@ async fn enroll(AxState(s): AxState<Arc<State>>, Json(e): Json<db::Enrollment>) 
 #[derive(Deserialize)]
 struct ConnectQuery {
     os_version: Option<String>,
+    /// The os-release VARIANT_ID, e.g. `nvidia`; absent on the plain OS.
+    variant: Option<String>,
     agent_version: Option<String>,
 }
 
@@ -645,6 +648,14 @@ async fn connect(
         s.db.seen(&device, q.os_version.as_deref(), q.agent_version.as_deref())
     {
         tracing::warn!("recording last-seen failed: {e}");
+    }
+    // Only a device that says which OS it runs says which variant: no variant
+    // then is the plain OS.
+    if q.os_version.is_some()
+        && let Err(e) =
+            s.db.set_variant(&device, q.variant.as_deref().unwrap_or_default())
+    {
+        tracing::warn!("recording the OS variant failed: {e}");
     }
     ws.on_upgrade(move |socket| async move {
         // A device that was offline catches up on what changed.

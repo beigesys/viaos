@@ -268,7 +268,12 @@ pub fn os_release(remote: &Remote, dir: &Path, key: Option<&Path>) -> Result<Val
         .as_str()
         .context("manifest has no version")?;
     let arch = manifest["arch"].as_str().context("manifest has no arch")?;
-    let base = format!("/v1/os/{arch}/{version}");
+    // A variant (`nvidia`) is its own line of versions: `x86_64-nvidia`.
+    let platform = match manifest["variant"].as_str() {
+        Some(v) if !v.is_empty() => format!("{arch}-{v}"),
+        _ => arch.to_string(),
+    };
+    let base = format!("/v1/os/{platform}/{version}");
 
     for f in manifest["files"]
         .as_array()
@@ -293,6 +298,7 @@ pub fn os_release(remote: &Remote, dir: &Path, key: Option<&Path>) -> Result<Val
     remote.put_file(&format!("{base}/manifest.json"), &manifest_path)?;
     Ok(json!({
         "arch": arch,
+        "variant": manifest["variant"],
         "version": version,
         "signed_by": signed,
         "next": "`list_os_versions` on the control plane shows it; `update_os` installs it.",

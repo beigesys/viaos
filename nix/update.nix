@@ -3,7 +3,8 @@
 #   viaos_<v>.efi                   the UKI
 #   viaos_<v>_<uuid>.store.raw.zst  the erofs /nix/store partition
 #   viaos_<v>_<uuid>.verity.raw.zst its verity hash partition
-#   manifest.json                   version, arch, and each file's sha256
+#   manifest.json                   version, arch, variant (if not the plain
+#                                   OS) and each file's sha256
 #
 # The UUIDs are the ones repart derived from the verity root hash, which is
 # how the UKI's usrhash finds its partitions. sysupdate writes them back onto
@@ -17,6 +18,9 @@
   uki,
   version,
   arch,
+  # VARIANT_ID, e.g. `nvidia`; null for the plain OS. A device installs only
+  # its own variant.
+  variant ? null,
 }:
 runCommand "viaos-update-${version}"
   {
@@ -48,5 +52,7 @@ runCommand "viaos-update-${version}"
     (cd $out && for f in viaos_*; do
       jq -n --arg n "$f" --arg h "$(sha256sum $f | cut -d' ' -f1)" --argjson s "$(stat -c %s $f)" \
         '{name: $n, sha256: $h, size: $s}'
-    done) | jq -s --arg v ${version} --arg a ${arch} '{version: $v, arch: $a, files: .}' > $out/manifest.json
+    done) | jq -s --arg v ${version} --arg a ${arch} --arg var "${toString variant}" \
+      '{version: $v, arch: $a} + (if $var == "" then {} else {variant: $var} end) + {files: .}' \
+      > $out/manifest.json
   ''

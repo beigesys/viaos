@@ -25,6 +25,9 @@ const SOURCE_DIR: &str = "os-update";
 pub struct Manifest {
     pub version: String,
     pub arch: String,
+    /// The build of viaos it is, e.g. `nvidia`; empty for the plain one.
+    #[serde(default)]
+    pub variant: String,
     pub files: Vec<ManifestFile>,
     /// Set by `via os-release --secure-boot`: the UKI is signed for the
     /// fleet's Secure Boot keys.
@@ -159,6 +162,23 @@ impl Updater {
                 std::env::consts::ARCH
             );
         }
+        // An update to another variant would drop what this device was
+        // flashed for, its GPU driver, say. Moving variant is a reflash.
+        let variant = current_variant();
+        if manifest.variant != variant {
+            let name = |v: &str| {
+                if v.is_empty() {
+                    "plain viaos".to_string()
+                } else {
+                    format!("the {v} variant")
+                }
+            };
+            bail!(
+                "update is {}, this device runs {}",
+                name(&manifest.variant),
+                name(&variant)
+            );
+        }
         // Firmware would refuse the UKI three times, then boot the old
         // version: an update that cannot work. Say so now instead.
         if secure_boot() && !manifest.secure_boot {
@@ -248,6 +268,22 @@ pub fn current_version() -> Option<String> {
     let text = std::fs::read_to_string("/etc/os-release").ok()?;
     text.lines()
         .find_map(|l| l.strip_prefix("IMAGE_VERSION="))
+        .map(|v| v.trim_matches('"').to_string())
+}
+
+/// The variant of viaos running, from os-release: empty for the plain one.
+pub fn current_variant() -> String {
+    std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .as_deref()
+        .and_then(variant_of)
+        .unwrap_or_default()
+}
+
+fn variant_of(os_release: &str) -> Option<String> {
+    os_release
+        .lines()
+        .find_map(|l| l.strip_prefix("VARIANT_ID="))
         .map(|v| v.trim_matches('"').to_string())
 }
 
@@ -414,5 +450,23 @@ mod install_tests {
         let script = sysupdate(d.path(), "exit 0");
         install(&script, "2").await.unwrap();
         assert_eq!(log(d.path()), "update 2\n");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_variant_comes_from_os_release() {
+        assert_eq!(
+            variant_of("NAME=viaos\nVARIANT_ID=nvidia\nIMAGE_VERSION=3\n").as_deref(),
+            Some("nvidia")
+        );
+        assert_eq!(
+            variant_of("NAME=viaos\nVARIANT_ID=\"nvidia\"\n").as_deref(),
+            Some("nvidia")
+        );
+        assert_eq!(variant_of("NAME=viaos\nIMAGE_VERSION=3\n"), None);
     }
 }

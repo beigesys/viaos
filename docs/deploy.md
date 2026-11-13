@@ -433,7 +433,8 @@ via-server device-type remove rock-5b
 A type uses `viaos-<id>.raw` if one was uploaded with `via base-image
 --device-type <id>`, and otherwise the base image for its architecture.
 Enroll marks a type with neither as `no image`. The arm64 base image serves both
-Raspberry Pi and generic UEFI boards. Registering a type doesn't build an OS for
+Raspberry Pi and generic UEFI boards. `pc-nvidia` is the exception: it runs a
+variant of the OS (see [GPUs](#gpus)), so only its own image will do. Registering a type doesn't build an OS for
 it: x86_64 and aarch64 are the architectures this repository builds.
 
 To work on it:
@@ -445,6 +446,61 @@ VIA_SERVER=http://localhost:8471 bun run dev
 
 `bun run build` and a rebuild of `via-server` embed it. After changing
 `web/bun.lock`, update the hash in `nix/web.nix`.
+
+## GPUs
+
+`PC with NVIDIA GPU` (`pc-nvidia`) is x86_64 viaos with the NVIDIA driver and
+the NVIDIA Container Toolkit. Each release carries its base image
+(`viaos-pc-nvidia.raw.zst`), which a server fetches like the others, and its
+OS updates (`viaos-update-x86_64-nvidia.tar`). It uses NVIDIA's open kernel
+modules, so it needs a Turing or newer GPU: GTX 16xx, RTX 20xx and everything
+since, and the data-center cards of those generations (T4, A2, L4...). Older
+cards (GTX 10xx and before) need the closed modules and an older driver
+branch, which this repository doesn't build (`viaos.nvidia.open = false` in
+`nix/nvidia.nix` is where to start).
+
+A service asks for the GPU the way Docker Compose always has:
+
+```yaml
+services:
+  inference:
+    image: nvidia/cuda:12.9.1-base-ubuntu24.04
+    command: ["sleep", "infinity"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all # or device_ids: ["0"]
+              capabilities: [gpu]
+```
+
+`docker run --gpus all` works the same. At boot the device writes a CDI spec
+for the GPUs it finds to `/run/cdi`, and Docker gives the container the
+devices, the driver's libraries and `nvidia-smi` from it; the image brings its
+own CUDA. To check a device, `via ssh <device>` and run:
+
+```bash
+nvidia-smi                                                  # the driver sees the GPU
+docker run --rm --gpus all nvidia/cuda:12.9.1-base-ubuntu24.04 nvidia-smi
+cat /run/cdi/nvidia-container-toolkit.json | head            # the CDI spec
+systemctl status nvidia-container-toolkit-cdi-generator     # if the spec is missing
+```
+
+Docker starts with or without a GPU, so a device that loses its GPU keeps
+running everything else; GPU containers then fail to start with
+`unresolvable CDI devices nvidia.com/gpu=all`.
+
+The variant is its own line of OS versions: devices report it (`variant:
+nvidia` in `list_devices`), `list_os_versions` shows each build as
+`x86_64-nvidia`, and `update_os` gives each device only its own variant's
+build, never the plain one. Moving a device between variants is a reflash.
+Build and publish one yourself with:
+
+```bash
+nix build .#images.x86_64-nvidia -o image && via base-image image/viaos_1.raw --device-type pc-nvidia
+nix build .#updates.x86_64-nvidia -o update && via os-release update
+```
 
 ## Reaching a device
 

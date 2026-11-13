@@ -28,7 +28,7 @@ let
 
   # Store slots are sized for growth: a later version must fit in the slot
   # the current one does not occupy.
-  storeSize = "2G";
+  storeSize = cfg.storeSize;
   veritySize = "64M";
   verityBlocks = {
     VerityDataBlockSizeBytes = 4096;
@@ -56,6 +56,7 @@ in
     ./network.nix
     ./sysupdate.nix
     ./rpi.nix
+    ./nvidia.nix
   ];
 
   options.viaos = {
@@ -64,6 +65,14 @@ in
       type = lib.types.str;
       default = lib.fileContents ../VERSION;
       description = "OS version. Updates install only versions that sort higher.";
+    };
+    storeSize = lib.mkOption {
+      type = lib.types.str;
+      default = "2G";
+      description = ''
+        Size of each /nix/store slot. Fixed when a device is flashed, so every
+        later version of this build must fit in it.
+      '';
     };
   };
 
@@ -267,6 +276,7 @@ in
       image = config.system.build.image;
       uki = "${config.system.build.uki}/${config.system.boot.loader.ukiFile}";
       arch = pkgs.stdenv.hostPlatform.uname.processor;
+      variant = config.system.nixos.variant_id;
     };
 
     # ---- the agent ----
