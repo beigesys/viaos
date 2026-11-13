@@ -11,8 +11,10 @@ mod host;
 mod link;
 mod metrics;
 mod os;
+mod proxy;
 mod ready;
 mod shell;
+mod system;
 mod tools;
 
 use std::path::PathBuf;
@@ -42,6 +44,9 @@ struct Cli {
 enum Command {
     /// Run as the device daemon: apply viaos.toml, then stay up.
     Run,
+    /// Apply viaos.toml's Wi-Fi, network, time and proxy settings. Runs
+    /// once per boot, before the network and Docker start.
+    System,
     /// Serve this device's MCP tools on stdin/stdout.
     Mcp,
     /// Print device health as JSON.
@@ -68,6 +73,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let cfg = config::Config::load(&cli.config)?;
+    // Before the trust policy: a bad key there is no reason to stay offline.
+    if let Command::System = cli.command {
+        system::apply(&cfg.system, &system::Paths::system(&cli.data_dir));
+        return Ok(());
+    }
     let device = Device::new(cli.data_dir.clone(), cfg.trust_policy()?);
     match cli.command {
         Command::Run => {
@@ -95,6 +105,7 @@ async fn main() -> Result<()> {
                 .waiting()
                 .await?;
         }
+        Command::System => unreachable!("applied above"),
         Command::Health => {
             println!("{}", serde_json::to_string_pretty(&device.health().await)?);
         }

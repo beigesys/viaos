@@ -20,7 +20,7 @@ These are the acceptance tests. A tool exists because one of these needs it.
 | Server | Where | Tools |
 | --- | --- | --- |
 | device | `via-agent mcp` on the device (stdio) | `device_health`, `logs`, `journal`, `exec`, `os_update`, `deploy`, `sync_env` |
-| fleet | `via-server` at `/mcp` (HTTP, API token or GitHub sign-in) | `list_fleets`, `device_metrics`, `create_fleet`, `update_fleet`, `update_device`, `delete_device`, `delete_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `exec`, `list_os_versions`, `update_os`, `list_releases`, `release_details`, `release_contents`, `os_version_details`, `deploy`, `create_provisioning_image`, `list_provisioning_images`, `list_variables`, `set_variable`, `update_variables`, `delete_variable`, `set_device_type`, `delete_device_type`, `audit_log`, `list_tokens`, `create_token`, `revoke_token`, `list_connections`, `revoke_connection`, `list_grants`, `set_grant`, `delete_grant` |
+| fleet | `via-server` at `/mcp` (HTTP, API token or GitHub sign-in) | `list_fleets`, `device_metrics`, `create_fleet`, `update_fleet`, `update_device`, `delete_device`, `delete_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `exec`, `list_os_versions`, `update_os`, `list_releases`, `release_details`, `release_contents`, `os_version_details`, `deploy`, `create_provisioning_image`, `list_provisioning_images`, `fleet_provisioning`, `set_fleet_provisioning`, `list_variables`, `set_variable`, `update_variables`, `delete_variable`, `set_device_type`, `delete_device_type`, `audit_log`, `list_tokens`, `create_token`, `revoke_token`, `list_connections`, `revoke_connection`, `list_grants`, `set_grant`, `delete_grant` |
 | local | `via mcp` on the operator's machine (stdio, root) | `list_disks`, `flash_image`, `flash_status`, `release_app` |
 
 The fleet server forwards device tools over each device's outbound
@@ -94,3 +94,12 @@ turns it into the real device, same id, so tags and variables set while it
 waited carry over. A second disk written with the same image is refused and
 recorded as `refused_enrollment_at` on the first. `delete_device` deletes a
 waiting device, revoking its token and its image.
+
+The same file carries the device's network and system settings: `[[wifi]]`,
+`[network]`, `[time]` and `[proxy]` (see `nix/viaos.example.toml`).
+`via-agent system` applies them early in every boot, before networkd, iwd,
+timesyncd and Docker start. A fleet can keep defaults for them with
+`set_fleet_provisioning`; a new image takes each section from the nearest
+fleet up the tree that sets it, unless `create_provisioning_image` is given
+its own. Wi-Fi passphrases are sealed like secrets and shown only as
+`has_passphrase`.

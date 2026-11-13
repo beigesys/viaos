@@ -20,6 +20,9 @@ pub enum Error {
 
     #[error("invalid platform {value:?}: {reason}")]
     InvalidPlatform { value: String, reason: String },
+
+    #[error("{what}: {reason}")]
+    InvalidSetting { what: String, reason: String },
 }
 
 impl Error {

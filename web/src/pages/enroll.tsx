@@ -2,8 +2,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { ago, gb, slug, tool } from "../lib";
-import { Button, buttonClass, Combobox, Copy, Empty, Failure, Field, Input, Notice, Section, Textarea } from "../ui";
+import { Button, buttonClass, Checkbox, Combobox, Copy, Empty, Failure, Field, Input, Notice, Section, Textarea } from "../ui";
 import { devicePath, useCan, useDevices } from "./fleet";
+import { Fold, type Form, formFrom, settingsFrom, type Shown, summary, SystemSettings } from "./netsettings";
 
 type Image = { file: string; fleet?: string | null; device?: string | null; title?: string | null; download: string; size_mb: number; created_at?: number };
 type DeviceType = { id: string; name: string; arch: string; detail: string; ready: boolean };
@@ -60,19 +61,36 @@ export function EnrollTab({ fleet }: { fleet: string }) {
   });
   const types = images.data?.device_types ?? [];
   const chosen = types.find((t) => t.id === picked) ?? types.find((t) => t.ready) ?? types[0];
+  const defaults = useQuery({
+    queryKey: ["fleet-provisioning", fleet],
+    queryFn: () => tool<{ settings: Shown }>("fleet_provisioning", { fleet }),
+    enabled: allowed && !!fleet,
+  });
+  const had = defaults.data?.settings;
+  // The fleet's defaults until someone edits the form.
+  const [edited, setEdited] = useState<Form | null>(null);
+  const form = edited ?? formFrom(had);
+  const [save, setSave] = useState(false);
   const make = useMutation({
-    mutationFn: () =>
-      tool<Image>("create_provisioning_image", {
+    mutationFn: async () => {
+      const settings = settingsFrom(form, had);
+      if (save) await tool("set_fleet_provisioning", { fleet, settings });
+      return tool<Image>("create_provisioning_image", {
         fleet,
         device_type: chosen?.id,
         ...(hostname.trim() ? { title: hostname.trim() } : {}),
         ssh_keys: keys.split("\n").map((k) => k.trim()).filter(Boolean),
-      }),
+        settings,
+      });
+    },
     onSuccess: () => {
       setHostname("");
+      setSave(false);
+      setEdited(null);
       qc.invalidateQueries({ queryKey: ["images"] });
       qc.invalidateQueries({ queryKey: ["devices"] });
-          },
+      qc.invalidateQueries({ queryKey: ["fleet-provisioning", fleet] });
+    },
   });
   const waiting = (images.data?.images ?? []).filter((i) => !i.fleet || i.fleet === fleet).sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0));
 
@@ -102,6 +120,12 @@ export function EnrollTab({ fleet }: { fleet: string }) {
             <Field label="SSH keys" hint="Optional, one per line. Allowed to log in as root.">
               <Textarea value={keys} onChange={(e) => setKeys(e.target.value)} rows={2} placeholder="ssh-ed25519 AAAA…" />
             </Field>
+            <Fold title="Network and system" detail={summary(form)}>
+              <SystemSettings form={form} onChange={setEdited} />
+              <Checkbox className="mt-4" checked={save} onChange={(e) => setSave(e.target.checked)}>
+                Save as defaults for {fleet}
+              </Checkbox>
+            </Fold>
             {chosen && !chosen.ready && (
               <Notice>
                 No base image for {chosen.name} on this server yet. Upload one with <code className="font-mono text-xs">via base-image --device-type {chosen.id}</code>, or <code className="font-mono text-xs">{chosen.arch}</code> to share it across that architecture.

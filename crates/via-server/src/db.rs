@@ -83,6 +83,14 @@ CREATE TABLE IF NOT EXISTS fleet_tags (
     tag       TEXT NOT NULL,
     PRIMARY KEY (fleet_id, tag)
 );
+-- A fleet's network and system defaults for new images, as JSON; Wi-Fi
+-- passphrases in it are sealed. See provisioning.rs.
+CREATE TABLE IF NOT EXISTS fleet_settings (
+    fleet_id    INTEGER PRIMARY KEY REFERENCES fleets(id),
+    settings    TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    updated_by  TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS device_tags (
     device_id TEXT NOT NULL REFERENCES devices(id),
     tag       TEXT NOT NULL,
@@ -614,6 +622,7 @@ impl Db {
         anyhow::ensure!(children == 0, "{name:?} still has fleets under it");
         let tx = c.transaction()?;
         tx.execute("DELETE FROM fleet_tags WHERE fleet_id = ?1", [id])?;
+        tx.execute("DELETE FROM fleet_settings WHERE fleet_id = ?1", [id])?;
         tx.execute("DELETE FROM grants WHERE fleet_id = ?1", [id])?;
         tx.execute("DELETE FROM enrollment_tokens WHERE fleet_id = ?1", [id])?;
         tx.execute(
@@ -622,6 +631,36 @@ impl Db {
         )?;
         tx.execute("DELETE FROM fleets WHERE id = ?1", [id])?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// A fleet's stored provisioning defaults, if it has any.
+    pub fn fleet_settings(&self, name: &str) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let id = fleet_id(&c, name)?;
+        Ok(c.query_row(
+            "SELECT settings FROM fleet_settings WHERE fleet_id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?)
+    }
+
+    /// Replace them; `None` removes them, so the fleet inherits.
+    pub fn set_fleet_settings(&self, name: &str, settings: Option<&str>, by: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        let id = fleet_id(&c, name)?;
+        match settings {
+            Some(json) => c.execute(
+                "INSERT INTO fleet_settings (fleet_id, settings, updated_at, updated_by)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (fleet_id) DO UPDATE SET
+                   settings = excluded.settings, updated_at = excluded.updated_at,
+                   updated_by = excluded.updated_by",
+                params![id, json, now(), by],
+            )?,
+            None => c.execute("DELETE FROM fleet_settings WHERE fleet_id = ?1", [id])?,
+        };
         Ok(())
     }
 

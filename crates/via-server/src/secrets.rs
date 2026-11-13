@@ -101,6 +101,17 @@ impl Secrets {
         )
     }
 
+    /// A Wi-Fi passphrase a fleet keeps for new images, tied to the fleet
+    /// and the network's name.
+    pub fn seal_wifi(&self, fleet: &str, ssid: &str, passphrase: &str) -> Vec<u8> {
+        self.seal("wifi", fleet, "", None, ssid, passphrase)
+    }
+
+    pub fn open_wifi(&self, fleet: &str, ssid: &str, sealed: &[u8]) -> Result<String> {
+        let aad = Self::binding("wifi", fleet, "", None, ssid);
+        self.open_sealed(sealed, &aad, &format!("Wi-Fi passphrase for {ssid:?}"))
+    }
+
     fn open_value(&self, v: &Variable) -> Result<String> {
         let aad = Self::binding(&v.scope, &v.target, &v.app, v.service.as_deref(), &v.key);
         self.open_sealed(&v.value, &aad, &v.key)

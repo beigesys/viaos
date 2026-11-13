@@ -35,6 +35,7 @@ mod mcp;
 mod oauth;
 mod os;
 mod os_track;
+mod provisioning;
 mod releases;
 mod secrets;
 mod web;

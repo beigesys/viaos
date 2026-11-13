@@ -53,6 +53,7 @@ in
     "${modulesPath}/profiles/minimal.nix"
     "${modulesPath}/profiles/perlless.nix"
     ./firmware.nix
+    ./network.nix
     ./sysupdate.nix
     ./rpi.nix
   ];
@@ -257,6 +258,8 @@ in
         live-restore = true;
       };
     };
+    # viaos.toml's [proxy], for image pulls; see network.nix.
+    systemd.services.docker.serviceConfig.EnvironmentFile = [ "-/run/via/proxy.env" ];
 
     # The files an update to this version is made of; see update.nix.
     system.build.update = pkgs.callPackage ./update.nix {
@@ -289,6 +292,8 @@ in
         Restart = "always";
         RestartSec = 5;
         StateDirectory = "via";
+        # viaos.toml's [proxy], for the control plane and downloads.
+        EnvironmentFile = [ "-/run/via/proxy.env" ];
       };
       environment = {
         VIA_CONFIG = "/boot/viaos.toml";
@@ -329,17 +334,6 @@ in
     };
 
     # ---- access ----
-
-    networking.useNetworkd = true;
-    systemd.network.networks."10-wired" = {
-      # Real interfaces only. A veth is `ether` too, and networkd taking one
-      # keeps it off Docker's bridge: no published ports, no container network.
-      matchConfig = {
-        Type = "ether";
-        Kind = "!*";
-      };
-      networkConfig.DHCP = "yes";
-    };
 
     services.openssh = {
       enable = true;
