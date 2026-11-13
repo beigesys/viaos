@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, type ReactNode } from "react";
 import { Link, matchPath, useLocation } from "react-router-dom";
-import { signOut, tool, type Caller, type Health, type Release } from "./lib";
+import { deviceState, signOut, tool, type Caller, type Health, type Release } from "./lib";
 import { Mark, ThemeSwitch } from "./main";
 import { Button, Pip } from "./ui";
 import { appPath, osPath, releasePath } from "./pages/catalog";
@@ -41,13 +41,14 @@ function DeviceItems({ fleet, device, tab, current }: { fleet: string; device: s
   const services = Array.isArray(health.data?.services) && d?.online ? health.data.services : [];
   const base = devicePath(fleet, device);
   const developer = useCan(fleet, "developer");
-  const tabs = ([["status", "Status"], ["logs", "Logs"], ["terminal", "Terminal"], ["journal", "Journal"], ["releases", "Releases"], ["variables", "Variables"]] as [string, string][]).filter(([t]) => developer || t !== "terminal");
+  // A waiting device has nothing to ask yet, only what it will be given.
+  const tabs = ([["status", "Status"], ["logs", "Logs"], ["terminal", "Terminal"], ["journal", "Journal"], ["releases", "Releases"], ["variables", "Variables"]] as [string, string][]).filter(([t]) => (developer || t !== "terminal") && (!d?.waiting || t === "status" || t === "variables"));
   return (
     <Group
       to={base}
       title={
         <>
-          <Pip state={!d ? "off" : d.online ? "ok" : d.os_update && !d.os_update.finished_at ? "warn" : "bad"} />
+          <Pip state={deviceState(d)} />
           <span className="truncate normal-case">{device}</span>
         </>
       }

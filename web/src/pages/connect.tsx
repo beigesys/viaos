@@ -1,6 +1,6 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Mark } from "../main";
-import { Button, Failure } from "../ui";
+import { Button, buttonClass, Copy, Failure, Input } from "../ui";
 
 type Pending = { request: string; client: string | null; host: string; local: boolean; who: string; admin: boolean };
 
@@ -11,20 +11,26 @@ async function pending(): Promise<Pending | null> {
   return res.json();
 }
 
-async function decide({ request, allow }: { request: string; allow: boolean }): Promise<void> {
+// A loopback answer comes back as a link to show: the person may have
+// approved on another machine, where localhost is nobody.
+async function decide({ request, allow }: { request: string; allow: boolean }): Promise<string | null> {
   const res = await fetch("/oauth/decide", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ request, allow }),
   });
   if (!res.ok) throw new Error("This request has expired. Start again from your client.");
-  location.assign((await res.json()).redirect);
+  const { redirect, loopback } = (await res.json()) as { redirect: string; loopback: boolean };
+  if (loopback) return redirect;
+  location.assign(redirect);
+  return null;
 }
 
 export function Connect() {
   const request = useQuery({ queryKey: ["connect"], queryFn: pending, retry: false });
   const answer = useMutation({ mutationFn: decide });
   const p = request.data;
+  const link = answer.data;
   return (
     <main className="flex min-h-dvh items-center justify-center p-4">
       <div className="w-full max-w-sm border border-rule bg-sheet">
@@ -38,7 +44,19 @@ export function Connect() {
         <div className="space-y-3 p-4 text-sm">
           <Failure error={request.error ?? answer.error} />
           {request.isSuccess && !p && <p>This request has expired. Start again from your client.</p>}
-          {p && (
+          {link ? (
+            <>
+              <p className="font-semibold">Allowed.</p>
+              <Input readOnly value={link} className="font-mono text-xs" onFocus={(e) => e.currentTarget.select()} />
+              <p className="text-ink-2">On another machine? Paste this link where your terminal asks for it. Use it within a minute.</p>
+              <div className="flex gap-2 pt-1">
+                <a href={link} className={buttonClass("primary")}>
+                  Open
+                </a>
+                <Copy text={link} />
+              </div>
+            </>
+          ) : p && (
             <>
               <p>
                 <strong className="font-semibold">{p.local ? "A program on this computer" : p.host}</strong> wants to use viaos as {p.who}.

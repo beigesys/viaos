@@ -324,6 +324,17 @@ pub struct Device {
     pub tags: Vec<String>,
     /// What people should know about it, in their own words.
     pub note: String,
+    /// Made with its provisioning image and not yet booted: it has no
+    /// credential, nothing runs on it, and its slug is already its own.
+    pub waiting: bool,
+    /// The image it waits for. Not shown: the id is the download link, which
+    /// is all it takes to enroll.
+    #[serde(skip)]
+    pub image: Option<String>,
+    /// When another device last tried to enroll with its image's token, which
+    /// was refused: the image was written to more than one disk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused_enrollment_at: Option<i64>,
 }
 
 /// What a device reports about itself when it enrolls.
@@ -382,6 +393,23 @@ impl Db {
                 conn.execute_batch(&format!(
                     "ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
                 ))?;
+            }
+        }
+        // A device made with its image waits to enroll: `waiting_image` names
+        // that image until it does. Its credential is a placeholder no hash
+        // can equal, which spares rebuilding the table to drop NOT NULL.
+        // `refused_at` is when a second device last tried its image's token;
+        // `device_id` is the waiting device a token turns into.
+        for (table, column, kind) in [
+            ("devices", "waiting_image", "TEXT"),
+            ("devices", "refused_at", "INTEGER"),
+            ("enrollment_tokens", "device_id", "TEXT"),
+        ] {
+            let has = conn
+                .prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?
+                .exists([table, column])?;
+            if !has {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
             }
         }
         // What a new server can image from the OS builds in this repository.
@@ -563,8 +591,9 @@ impl Db {
         self.os_updates_where("")
     }
 
-    /// Delete a fleet that holds nothing. Unused enrollment tokens go with it,
-    /// so an image made for it can no longer join.
+    /// Delete a fleet that holds nothing, not even a device waiting to enroll.
+    /// Unused enrollment tokens from before devices waited go with it, so an
+    /// image made for it can no longer join.
     pub fn delete_fleet(&self, name: &str) -> Result<()> {
         let mut c = self.conn.lock().unwrap();
         let id = fleet_id(&c, name)?;
@@ -573,7 +602,10 @@ impl Db {
             [id],
             |r| r.get(0),
         )?;
-        anyhow::ensure!(devices == 0, "{name:?} still has devices");
+        anyhow::ensure!(
+            devices == 0,
+            "{name:?} still has devices, enrolled or waiting"
+        );
         let children: i64 = c.query_row(
             "SELECT COUNT(*) FROM fleets WHERE parent_id = ?1",
             [id],
@@ -736,19 +768,112 @@ impl Db {
         Ok(token)
     }
 
+    /// Make the device a provisioning image will enroll, before it exists:
+    /// it waits in `fleet` from now on, and its slug is taken from now on.
+    /// A slug another device has gets the next free `-2`, `-3`, as at
+    /// enrollment. Without a hostname it holds a placeholder until it boots
+    /// and reports its own. Returns its single-use token and the device.
+    pub fn reserve_device(
+        &self,
+        fleet: &str,
+        hostname: Option<&str>,
+        title: &str,
+        ttl_secs: i64,
+        image_id: &str,
+    ) -> Result<(String, Device)> {
+        let title = check_title(title)?;
+        let mut c = self.conn.lock().unwrap();
+        let fleet_id = fleet_id(&c, fleet)?;
+        let tx = c.transaction()?;
+        let id = random_secret()[..16].to_string();
+        let base = match hostname {
+            Some(h) => slug(h)?,
+            None => format!("device-{}", &image_id[..6.min(image_id.len())]),
+        };
+        let name = free_slug(&tx, &base, None)?;
+        tx.execute(
+            "INSERT INTO devices (id, name, title, fleet_id, credential_hash, enrolled_at,
+                                  waiting_image)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id,
+                name,
+                title,
+                fleet_id,
+                format!("waiting:{image_id}"),
+                now(),
+                image_id
+            ],
+        )?;
+        let token = random_secret();
+        tx.execute(
+            "INSERT INTO enrollment_tokens (token_hash, fleet_id, hostname, title, created_at,
+                                            expires_at, image_id, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                hash(&token),
+                fleet_id,
+                hostname.map(|_| &name),
+                title,
+                now(),
+                now() + ttl_secs,
+                image_id,
+                id
+            ],
+        )?;
+        tx.commit()?;
+        drop(c);
+        Ok((token, self.device(&id)?.expect("just inserted")))
+    }
+
+    /// Delete a device that is waiting to enroll, with its tags and
+    /// variables, and revoke its token so its image enrolls nothing. Returns
+    /// the image, whose file the caller deletes. An enrolled device is
+    /// refused.
+    pub fn delete_waiting_device(&self, id: &str) -> Result<String> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        let (name, image): (String, Option<String>) = tx
+            .query_row(
+                "SELECT name, waiting_image FROM devices WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .with_context(|| format!("no device {id:?}"))?;
+        let Some(image) = image else {
+            bail!("{name} has enrolled; only a device waiting to enroll can be deleted")
+        };
+        tx.execute("DELETE FROM enrollment_tokens WHERE device_id = ?1", [id])?;
+        tx.execute("DELETE FROM device_tags WHERE device_id = ?1", [id])?;
+        tx.execute(
+            "DELETE FROM variables WHERE scope = 'device' AND target = ?1",
+            [id],
+        )?;
+        tx.execute("DELETE FROM os_updates WHERE device_id = ?1", [id])?;
+        tx.execute("DELETE FROM devices WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(image)
+    }
+
     /// Spend an enrollment token and register the device. Returns the device,
     /// its long-lived credential, and the provisioning image the token was
     /// written into, which has now served its purpose.
     ///
+    /// A token made with its device turns that waiting device into this one:
+    /// same id, so its title, note, tags and variables carry over. Its slug
+    /// stays too, unless it was only a placeholder for an image made without
+    /// a name; then the device takes the hostname it reports.
+    ///
     /// A token is single-use, so the same image written to two cards enrolls
     /// one device. The second is refused, rather than silently becoming the
-    /// first.
+    /// first, and the first records that it happened.
     pub fn enroll(&self, e: &Enrollment) -> Result<(Device, String, Option<String>)> {
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
         let row: Option<Spent> = tx
             .query_row(
-                "SELECT fleet_id, hostname, expires_at, used_by, image_id, title
+                "SELECT fleet_id, hostname, expires_at, used_by, image_id, title, device_id
                  FROM enrollment_tokens WHERE token_hash = ?1",
                 [hash(&e.token)],
                 |r| {
@@ -759,6 +884,7 @@ impl Db {
                         used_by: r.get(3)?,
                         image_id: r.get(4)?,
                         title: r.get(5)?,
+                        device_id: r.get(6)?,
                     })
                 },
             )
@@ -770,49 +896,79 @@ impl Db {
             used_by,
             image_id,
             title,
+            device_id,
         }) = row
         else {
             bail!("unknown token")
         };
-        if used_by.is_some() {
+        if let Some(first) = used_by {
+            tx.execute(
+                "UPDATE devices SET refused_at = ?2 WHERE id = ?1",
+                params![first, now()],
+            )?;
+            tx.commit()?;
             bail!("token already used");
         }
         if expires_at < now() {
             bail!("token expired");
         }
-        let id = random_secret()[..16].to_string();
-        // A device's slug is its hostname, lowercase, and no other device's:
-        // two boxes both left as `viaos` become `viaos` and `viaos-2`.
-        let base = slug(&hostname.unwrap_or_else(|| e.hostname.clone()))
-            .unwrap_or_else(|_| "device".into());
-        let taken = |n: &str| -> rusqlite::Result<bool> {
-            tx.prepare("SELECT 1 FROM devices WHERE lower(name) = ?1")?
-                .exists([n])
-        };
-        let mut name = base.clone();
-        let mut n = 2;
-        while taken(&name)? {
-            let suffix = format!("-{n}");
-            name = format!("{}{suffix}", &base[..base.len().min(63 - suffix.len())]);
-            n += 1;
-        }
         let credential = random_secret();
-        tx.execute(
-            "INSERT INTO devices (id, name, title, fleet_id, credential_hash, arch, os_version,
-                                  agent_version, enrolled_at)
-             VALUES (?1, ?2, ?9, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                id,
-                name,
-                fleet_id,
-                hash(&credential),
-                e.arch,
-                e.os_version,
-                e.agent_version,
-                now(),
-                title
-            ],
-        )?;
+        let waiting = match &device_id {
+            Some(d) => tx
+                .prepare("SELECT 1 FROM devices WHERE id = ?1 AND waiting_image IS NOT NULL")?
+                .exists([d])?,
+            None => false,
+        };
+        let id = if let (true, Some(id)) = (waiting, device_id) {
+            if hostname.is_none() {
+                let base = slug(&e.hostname).unwrap_or_else(|_| "device".into());
+                let name = free_slug(&tx, &base, Some(&id))?;
+                tx.execute(
+                    "UPDATE devices SET name = ?2 WHERE id = ?1",
+                    params![id, name],
+                )?;
+            }
+            tx.execute(
+                "UPDATE devices SET credential_hash = ?2, arch = ?3, os_version = ?4,
+                        agent_version = ?5, enrolled_at = ?6, waiting_image = NULL
+                 WHERE id = ?1",
+                params![
+                    id,
+                    hash(&credential),
+                    e.arch,
+                    e.os_version,
+                    e.agent_version,
+                    now()
+                ],
+            )?;
+            id
+        } else {
+            // A token from before devices waited, or one minted bare.
+            let id = random_secret()[..16].to_string();
+            // A device's slug is its hostname, lowercase, and no other
+            // device's: two boxes both left as `viaos` become `viaos` and
+            // `viaos-2`.
+            let base = slug(&hostname.unwrap_or_else(|| e.hostname.clone()))
+                .unwrap_or_else(|_| "device".into());
+            let name = free_slug(&tx, &base, None)?;
+            tx.execute(
+                "INSERT INTO devices (id, name, title, fleet_id, credential_hash, arch, os_version,
+                                      agent_version, enrolled_at)
+                 VALUES (?1, ?2, ?9, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    id,
+                    name,
+                    fleet_id,
+                    hash(&credential),
+                    e.arch,
+                    e.os_version,
+                    e.agent_version,
+                    now(),
+                    title
+                ],
+            )?;
+            id
+        };
         tx.execute(
             "UPDATE enrollment_tokens SET used_by = ?1 WHERE token_hash = ?2",
             params![id, hash(&e.token)],
@@ -826,10 +982,11 @@ impl Db {
         ))
     }
 
+    /// The device holding `credential`. A waiting device holds none.
     pub fn authenticate(&self, credential: &str) -> Result<Option<String>> {
         let c = self.conn.lock().unwrap();
         Ok(c.query_row(
-            "SELECT id FROM devices WHERE credential_hash = ?1",
+            "SELECT id FROM devices WHERE credential_hash = ?1 AND waiting_image IS NULL",
             [hash(credential)],
             |r| r.get(0),
         )
@@ -1082,6 +1239,9 @@ impl Db {
 
     /// Remove what has expired. Anyone can add to these tables, so it also
     /// keeps them bounded: past [`OAUTH_MAX_ROWS`] the oldest idle rows go.
+    /// Idle clients are never removed for age alone: a client caches the id
+    /// it registered and comes back with it, days later, without registering
+    /// again, so deleting it would strand that client at "Unknown client".
     fn oauth_tidy(c: &Connection) -> Result<()> {
         let t = now();
         c.execute("DELETE FROM oauth_requests WHERE expires_at <= ?1", [t])?;
@@ -1095,10 +1255,6 @@ impl Db {
         )?;
         const IDLE: &str = "id NOT IN (SELECT client_id FROM oauth_grants)
              AND id NOT IN (SELECT client_id FROM oauth_requests WHERE caller IS NOT NULL)";
-        c.execute(
-            &format!("DELETE FROM oauth_clients WHERE created_at <= ?1 AND {IDLE}"),
-            [t - 86400],
-        )?;
         c.execute(
             &format!(
                 "DELETE FROM oauth_clients WHERE {IDLE} AND id IN (
@@ -1542,7 +1698,7 @@ const DEVICE_SELECT: &str = "
     SELECT d.id, d.name, f.name, d.arch, d.os_version, d.agent_version, d.enrolled_at, d.last_seen,
            (SELECT group_concat(tag, char(10)) FROM
               (SELECT tag FROM device_tags WHERE device_id = d.id ORDER BY tag)),
-           d.note, d.title
+           d.note, d.title, d.waiting_image, d.refused_at
     FROM devices d JOIN fleets f ON f.id = d.fleet_id";
 
 /// A tag is `key` or `key=value`, on a fleet or a device. The key is a plain
@@ -1621,6 +1777,7 @@ struct Spent {
     used_by: Option<String>,
     image_id: Option<String>,
     title: String,
+    device_id: Option<String>,
 }
 
 /// A slug from what someone typed: lowercase letters, digits and single
@@ -1683,7 +1840,24 @@ fn device_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
             .unwrap_or_default(),
         note: r.get(9)?,
         title: r.get(10)?,
+        waiting: r.get::<_, Option<String>>(11)?.is_some(),
+        image: r.get(11)?,
+        refused_enrollment_at: r.get(12)?,
     })
+}
+
+/// The first of `base`, `base-2`, `base-3`… that no device, enrolled or
+/// waiting, has; `except` is one whose own slug doesn't count.
+fn free_slug(c: &Connection, base: &str, except: Option<&str>) -> rusqlite::Result<String> {
+    let mut q = c.prepare("SELECT 1 FROM devices WHERE lower(name) = ?1 AND id IS NOT ?2")?;
+    let mut name = base.to_string();
+    let mut n = 2;
+    while q.exists(params![name, except])? {
+        let suffix = format!("-{n}");
+        name = format!("{}{suffix}", &base[..base.len().min(63 - suffix.len())]);
+        n += 1;
+    }
+    Ok(name)
 }
 
 /// The ids of the fleet named by `?1` and every fleet under it.
@@ -1885,6 +2059,55 @@ mod tests {
         let db = Db::open(&path).unwrap();
         db.set_variable(&variable(Some("web"), "x")).unwrap();
         assert_eq!(db.variables().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn idle_oauth_clients_survive_age_but_not_the_bound() {
+        let (_d, db) = db();
+        let uris = vec!["http://localhost:1234/callback".to_string()];
+        let old = db.oauth_add_client(Some("claude"), &uris).unwrap();
+        // Registered a week ago and never signed in: it comes back with
+        // the id it cached, so it must still be known.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE oauth_clients SET created_at = ?1 WHERE id = ?2",
+                params![now() - 7 * 86400, old],
+            )
+            .unwrap();
+        db.oauth_sweep().unwrap();
+        assert!(
+            db.oauth_client(&old).unwrap().is_some(),
+            "idle client aged out"
+        );
+
+        // Anyone can register, so past the bound the oldest idle ones go.
+        {
+            let c = db.conn.lock().unwrap();
+            let mut stmt = c
+                .prepare(
+                    "INSERT INTO oauth_clients (id, name, redirect_uris, created_at)
+                     VALUES (?1, NULL, '[]', ?2)",
+                )
+                .unwrap();
+            for i in 0..OAUTH_MAX_ROWS {
+                stmt.execute(params![format!("filler-{i}"), now()]).unwrap();
+            }
+        }
+        let fresh = db.oauth_add_client(None, &uris).unwrap();
+        assert!(
+            db.oauth_client(&old).unwrap().is_none(),
+            "bound kept the oldest"
+        );
+        assert!(db.oauth_client(&fresh).unwrap().is_some());
+        let n: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM oauth_clients", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, OAUTH_MAX_ROWS);
     }
 
     fn db() -> (tempfile::TempDir, Db) {
@@ -2235,5 +2458,133 @@ mod tests {
             .query_row("SELECT actor FROM audit", [], |r| r.get(0))
             .unwrap();
         assert_eq!(actor, "ana");
+    }
+
+    #[test]
+    fn a_waiting_device_holds_its_slug() {
+        let (_d, db) = db();
+        db.create_fleet("line").unwrap();
+        let (_, scale) = db
+            .reserve_device(
+                "line",
+                Some("scale"),
+                "Scale",
+                60,
+                "aaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap();
+        assert!(scale.waiting);
+        assert_eq!(
+            (scale.name.as_str(), scale.title.as_str()),
+            ("scale", "Scale")
+        );
+        // Another image asking for it gets the next free one…
+        let (_, second) = db
+            .reserve_device("line", Some("scale"), "", 60, "bbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap();
+        assert_eq!(second.name, "scale-2");
+        // …and so does a device enrolling with an older, bare token.
+        let token = db.mint_token("line", Some("scale"), "", 60, None).unwrap();
+        let (bare, _, _) = db.enroll(&enrollment(&token)).unwrap();
+        assert_eq!(bare.name, "scale-3");
+        // An unnamed image's placeholder is a slug like any other.
+        let (_, unnamed) = db
+            .reserve_device("line", None, "", 60, "cccccccccccccccccccccccc")
+            .unwrap();
+        assert_eq!(unnamed.name, "device-cccccc");
+        assert_eq!(db.devices(Some("line")).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn enrolling_turns_the_waiting_device_into_the_real_one() {
+        let (_d, db) = db();
+        db.create_fleet("line").unwrap();
+        let (token, waiting) = db
+            .reserve_device(
+                "line",
+                Some("scale"),
+                "Scale",
+                60,
+                "aaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap();
+        db.set_device_tags(&waiting.id, &["site=east".into()])
+            .unwrap();
+        db.set_device_note(&waiting.id, "on the left").unwrap();
+        db.set_variable(&Variable {
+            scope: "device".into(),
+            target: waiting.id.clone(),
+            ..variable(None, "v")
+        })
+        .unwrap();
+        // It can't sign in as itself before it has a credential.
+        assert_eq!(
+            db.authenticate("waiting:aaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            None
+        );
+
+        let (d, credential, image) = db.enroll(&enrollment(&token)).unwrap();
+        assert_eq!(d.id, waiting.id);
+        assert!(!d.waiting);
+        assert_eq!(image.as_deref(), Some("aaaaaaaaaaaaaaaaaaaaaaaa"));
+        // The image named it, so it keeps its slug, not the hostname it reported.
+        assert_eq!((d.name.as_str(), d.title.as_str()), ("scale", "Scale"));
+        assert_eq!(d.tags, ["site=east"]);
+        assert_eq!(d.note, "on the left");
+        assert_eq!(d.arch.as_deref(), Some("x86_64"));
+        assert!(db.variables().unwrap().iter().any(|v| v.target == d.id));
+        assert_eq!(db.authenticate(&credential).unwrap(), Some(d.id.clone()));
+        assert_eq!(db.devices(None).unwrap().len(), 1);
+
+        // Unnamed, it gives up its placeholder for what it reports.
+        let (token, waiting) = db
+            .reserve_device("line", None, "", 60, "bbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap();
+        let (d, _, _) = db.enroll(&enrollment(&token)).unwrap();
+        assert_eq!((d.id, d.name.as_str()), (waiting.id, "viaos"));
+    }
+
+    #[test]
+    fn a_second_disk_with_the_same_image_is_refused_and_remembered() {
+        let (_d, db) = db();
+        db.create_fleet("line").unwrap();
+        let (token, _) = db
+            .reserve_device("line", Some("scale"), "", 60, "aaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+        let (first, _, _) = db.enroll(&enrollment(&token)).unwrap();
+        assert_eq!(first.refused_enrollment_at, None);
+        let e = db.enroll(&enrollment(&token)).unwrap_err();
+        assert!(e.to_string().contains("already used"), "{e}");
+        let first = db.device(&first.id).unwrap().unwrap();
+        assert!(first.refused_enrollment_at.is_some());
+        assert_eq!(db.devices(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deleting_a_waiting_device_revokes_its_image() {
+        let (_d, db) = db();
+        db.create_fleet("line").unwrap();
+        let (token, waiting) = db
+            .reserve_device("line", Some("scale"), "", 60, "aaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+        db.set_device_tags(&waiting.id, &["x".into()]).unwrap();
+        assert!(
+            db.delete_fleet("line")
+                .unwrap_err()
+                .to_string()
+                .contains("waiting")
+        );
+        assert_eq!(
+            db.delete_waiting_device(&waiting.id).unwrap(),
+            "aaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let e = db.enroll(&enrollment(&token)).unwrap_err();
+        assert!(e.to_string().contains("unknown token"), "{e}");
+        assert!(db.devices(None).unwrap().is_empty());
+        // Its slug is free again, and an enrolled device can't be deleted.
+        let token = db.mint_token("line", Some("scale"), "", 60, None).unwrap();
+        let (d, _, _) = db.enroll(&enrollment(&token)).unwrap();
+        assert_eq!(d.name, "scale");
+        assert!(db.delete_waiting_device(&d.id).is_err());
     }
 }

@@ -35,3 +35,4 @@ via-link.workspace = true
 [dev-dependencies]
 tar.workspace = true
 tempfile.workspace = true
+fatfs.workspace = true

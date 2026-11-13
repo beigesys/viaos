@@ -1,18 +1,28 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { ago, gb, slug, tool } from "../lib";
 import { Button, buttonClass, Combobox, Copy, Empty, Failure, Field, Input, Notice, Section, Textarea } from "../ui";
-import { useCan } from "./fleet";
+import { devicePath, useCan, useDevices } from "./fleet";
 
-type Image = { file: string; fleet?: string | null; download: string; size_mb: number; created_at?: number };
+type Image = { file: string; fleet?: string | null; device?: string | null; title?: string | null; download: string; size_mb: number; created_at?: number };
 type DeviceType = { id: string; name: string; arch: string; detail: string; ready: boolean };
 
+/** Writing an image straight from its link, for a disk on this machine. */
+export const writeCommand = (download: string) => `curl -sL ${download} | zstdcat | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync`;
+
 function Written({ image }: { image: Image }) {
-  const cmd = `curl -sL ${image.download} | zstdcat | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync`;
+  const cmd = writeCommand(image.download);
   return (
     <div className="border-b border-rule py-3">
       <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-        <span className="font-mono text-sm font-medium break-all">{image.file}</span>
+        {image.device && image.fleet ? (
+          <Link to={devicePath(image.fleet, image.device)} className={`font-medium break-all hover:underline ${image.title ? "text-sm" : "font-mono text-sm"}`}>
+            {image.title || image.device}
+          </Link>
+        ) : (
+          <span className="font-mono text-sm font-medium break-all">{image.file}</span>
+        )}
         <span className="font-mono text-xs text-ink-3">
           {gb(image.size_mb)}
           {image.created_at ? ` · ${ago(image.created_at)}` : ""}
@@ -30,6 +40,15 @@ function Written({ image }: { image: Image }) {
 
 export function EnrollTab({ fleet }: { fleet: string }) {
   const allowed = useCan(fleet, "developer");
+  const devices = useDevices();
+  // As the server picks it: a slug another device has, waiting or not, gets
+  // the next free -2, -3. It may know of devices this caller can't see.
+  const taken = new Set((devices.data ?? []).map((d) => d.name));
+  const free = (base: string) => {
+    let name = base;
+    for (let n = 2; taken.has(name); n++) name = `${base.slice(0, 63 - `-${n}`.length)}-${n}`;
+    return name;
+  };
   const qc = useQueryClient();
   const [hostname, setHostname] = useState("");
   const [picked, setPicked] = useState("");
@@ -52,6 +71,7 @@ export function EnrollTab({ fleet }: { fleet: string }) {
     onSuccess: () => {
       setHostname("");
       qc.invalidateQueries({ queryKey: ["images"] });
+      qc.invalidateQueries({ queryKey: ["devices"] });
           },
   });
   const waiting = (images.data?.images ?? []).filter((i) => !i.fleet || i.fleet === fleet).sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0));
@@ -76,7 +96,7 @@ export function EnrollTab({ fleet }: { fleet: string }) {
                 options={types.map((t) => ({ value: t.id, label: t.name, detail: t.detail, group: t.arch, badge: t.ready ? undefined : "no image" }))}
               />
             </Field>
-            <Field label="Name" hint={slug(hostname) ? <>Hostname and slug <span className="font-mono">{slug(hostname)}</span></> : "Optional. The device keeps the hostname it reports otherwise."}>
+            <Field label="Name" hint={slug(hostname) ? <>Hostname and slug <span className="font-mono">{free(slug(hostname))}</span></> : "Optional. The device keeps the hostname it reports otherwise."}>
               <Input value={hostname} onChange={(e) => setHostname(e.target.value)} placeholder="Packing scale" maxLength={100} />
             </Field>
             <Field label="SSH keys" hint="Optional, one per line. Allowed to log in as root.">

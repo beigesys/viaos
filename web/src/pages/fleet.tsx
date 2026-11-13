@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { ago, atLeast, called, fleetTags, hasTag, lineage, slug, tagChoices, tool, under, type Device, type Fleet, type Level } from "../lib";
+import { ago, atLeast, called, deviceState, fleetTags, hasTag, lineage, slug, tagChoices, tool, under, type Device, type Fleet, type Level } from "../lib";
 import { useIsAdmin } from "../main";
 import { Button, buttonClass, Combobox, Empty, Failure, Field, Headline, Input, Modal, Pip, Readout, Section, Tag, Textarea } from "../ui";
 import { useRunning } from "./catalog";
@@ -94,7 +94,7 @@ function FleetTable({ rows, all, devices, showPath }: { rows: Fleet[]; all: Flee
   const nav = useNavigate();
   const count = (fleet: string, online: boolean) => {
     const tree = under(all, fleet);
-    return devices.filter((d) => tree.includes(d.fleet) && d.online === online).length;
+    return devices.filter((d) => tree.includes(d.fleet) && !d.waiting && d.online === online).length;
   };
   return (
     <div className="mb-4 border border-rule bg-sheet">
@@ -350,11 +350,14 @@ function SettingsTab({ fleet, fleets }: { fleet: string; fleets: Fleet[] }) {
   );
 }
 
+/** Offline first, since that's what needs looking at; waiting last. */
+const rank = (d: Device) => (d.waiting ? 2 : d.online ? 1 : 0);
+
 function DevicesTab({ fleet, devices, loaded, canEnroll, hasChildren }: { fleet: string; devices: Device[]; loaded: boolean; canEnroll: boolean; hasChildren: boolean }) {
   const [filter, setFilter] = useState("");
   const shown = devices
     .filter((d) => !filter || `${d.name} ${d.title} ${d.arch} ${d.os_version} ${d.tags.join(" ")}`.toLowerCase().includes(filter.toLowerCase()))
-    .sort((a, b) => Number(a.online) - Number(b.online) || called(a).localeCompare(called(b)));
+    .sort((a, b) => rank(a) - rank(b) || called(a).localeCompare(called(b)));
   if (loaded && devices.length === 0 && hasChildren) return null;
   if (loaded && devices.length === 0) {
     return (
@@ -398,7 +401,7 @@ function DeviceTable({ devices, all, showFleet }: { devices: Device[]; all?: Fle
             <tr key={d.id} onClick={() => nav(devicePath(d.fleet, d.name))} className="cursor-pointer h-10 border-b border-rule transition-colors last:border-b-0 hover:bg-well max-sm:h-11">
               <td className="px-3">
                 <div className="flex items-center gap-2.5">
-                  <Pip state={d.online ? "ok" : d.os_update && !d.os_update.finished_at ? "warn" : "bad"} />
+                  <Pip state={deviceState(d)} />
                   <div className="min-w-0">
                     <Link to={devicePath(d.fleet, d.name)} onClick={(e) => e.stopPropagation()} className={`block truncate font-semibold ${d.title ? "" : "font-mono"}`}>
                       {called(d)}
@@ -422,7 +425,7 @@ function DeviceTable({ devices, all, showFleet }: { devices: Device[]; all?: Fle
               <td className="px-3 font-mono text-xs text-ink-2 max-md:hidden">{d.arch ?? "–"}</td>
               <td className="px-3 font-mono text-xs max-sm:hidden">{d.os_version ?? "–"}</td>
               <td className="px-3 font-mono text-xs text-ink-2 max-md:hidden">{d.agent_version ?? "–"}</td>
-              <td className={`px-3 text-right font-mono text-xs whitespace-nowrap ${d.os_update && !d.os_update.finished_at ? "text-warn" : d.online ? "text-ink-3" : "text-bad"}`}>{d.os_update && !d.os_update.finished_at ? `updating to ${d.os_update.version}${d.os_update.progress != null ? ` ${d.os_update.progress}%` : ""}` : d.online ? "connected" : ago(d.last_seen)}</td>
+              <td className={`px-3 text-right font-mono text-xs whitespace-nowrap ${d.waiting ? "text-ink-3" : d.os_update && !d.os_update.finished_at ? "text-warn" : d.online ? "text-ink-3" : "text-bad"}`}>{d.waiting ? "waiting to enroll" : d.os_update && !d.os_update.finished_at ? `updating to ${d.os_update.version}${d.os_update.progress != null ? ` ${d.os_update.progress}%` : ""}` : d.online ? "connected" : ago(d.last_seen)}</td>
             </tr>
           ))}
         </tbody>
@@ -448,7 +451,7 @@ export function FleetPage() {
   const mine = everything.filter((d) => d.fleet === fleet);
   const children = all.filter((f) => f.parent === fleet);
   const on = everything.filter((d) => d.online).length;
-  const off = everything.length - on;
+  const off = everything.filter((d) => !d.online && !d.waiting).length;
   const me = all.find((f) => f.name === fleet);
 
   if (fleets.isSuccess && !fleets.data.some((f) => f.name === fleet)) {

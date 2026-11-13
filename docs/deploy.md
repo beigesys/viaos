@@ -264,7 +264,7 @@ fleet under it, or on every fleet, from the Access page or `set_grant`:
 |---|---|
 | Observer | See the fleet's devices, health, logs, journal, releases and variables |
 | Operator | Also change its devices' tags and their own variables |
-| Developer | Also deploy, update the OS, set the fleet's variables, run commands and open terminals on its devices, enroll devices, and add, move or delete fleets under it |
+| Developer | Also deploy, update the OS, set the fleet's variables, run commands and open terminals on its devices, enroll devices or delete ones waiting to enroll, and add, move or delete fleets under it |
 
 A grant names a GitHub user (`github:<login>`), a GitHub team
 (`github-team:<slug>`), everyone in the GitHub organisation (`github-org`), or an
@@ -334,6 +334,21 @@ Access tokens last an hour, and each refresh asks GitHub again, so someone
 removed from the organisation is out within the hour. GitHub's token for each
 connection is kept sealed with the server's secret key. An admin can see every
 connection on the Access page and revoke one at once.
+
+### Enrolling devices
+
+A fleet's Enroll tab makes a provisioning image for one device. The device is
+in the fleet's list from that moment, waiting to enroll, under the slug it will
+have; a slug another device has, enrolled or waiting, gets `-2`, `-3`. Tags,
+notes and variables set on it while it waits are its own when it enrolls,
+because it is the same device. Its page downloads the image again until then.
+
+An image carries a single-use token. If it is written to two disks, the second
+device to boot is refused, and the first device's page says when that happened.
+Deleting a waiting device revokes its token and deletes its image. An image made
+without a name waits under `device-` and part of its id, and takes the hostname
+the device reports when it enrolls. Images are deleted once their device
+enrolls, and their tokens expire after 30 days.
 
 ### Hardware
 

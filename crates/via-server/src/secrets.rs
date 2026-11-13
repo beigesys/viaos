@@ -264,6 +264,9 @@ mod tests {
             last_seen: None,
             tags: Vec::new(),
             note: String::new(),
+            waiting: false,
+            image: None,
+            refused_enrollment_at: None,
         }
     }
 

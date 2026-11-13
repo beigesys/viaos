@@ -216,6 +216,14 @@ impl State {
     pub fn releases_dir(&self) -> PathBuf {
         self.data_dir.join("releases")
     }
+
+    /// Delete a provisioning image once its token can enroll nothing more:
+    /// it is gigabytes.
+    pub fn delete_image(&self, id: &str) {
+        for ext in ["raw.zst", "name", "fleet"] {
+            let _ = std::fs::remove_file(self.out_dir().join(format!("{id}.{ext}")));
+        }
+    }
 }
 
 #[tokio::main]
@@ -587,16 +595,16 @@ async fn enroll(AxState(s): AxState<Arc<State>>, Json(e): Json<db::Enrollment>) 
     match s.db.enroll(&e) {
         Ok((device, credential, image)) => {
             tracing::info!(device = %device.id, name = %device.name, fleet = %device.fleet, "enrolled");
-            // The image held a token that is now spent; it can enroll nothing
-            // else, and it is gigabytes.
+            // The image held a token that is now spent.
             if let Some(id) = image {
-                let _ = std::fs::remove_file(s.out_dir().join(format!("{id}.raw.zst")));
-                let _ = std::fs::remove_file(s.out_dir().join(format!("{id}.name")));
-                let _ = std::fs::remove_file(s.out_dir().join(format!("{id}.fleet")));
+                s.delete_image(&id);
             }
             Json(json!({ "device": device, "credential": credential })).into_response()
         }
-        Err(err) => (StatusCode::FORBIDDEN, err.to_string()).into_response(),
+        Err(err) => {
+            tracing::warn!(hostname = %e.hostname, "enrollment refused: {err}");
+            (StatusCode::FORBIDDEN, err.to_string()).into_response()
+        }
     }
 }
 
@@ -825,6 +833,7 @@ fn developer_on(
         anyhow::bail!("no device named {device:?}");
     }
     a.require(&d.fleet, access::Level::Developer, what)?;
+    anyhow::ensure!(!d.waiting, "{} is waiting to enroll", d.name);
     Ok(d)
 }
 

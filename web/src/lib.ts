@@ -96,7 +96,20 @@ export type Device = {
   tags: string[];
   /** From the fleets it sits in. */
   inherited_tags?: string[];
+  /** Made with its provisioning image, which hasn't booted yet. */
+  waiting: boolean;
+  /** Its image, while it waits; only for developers on its fleet. */
+  download?: string;
+  /** When a second disk written with its image tried to enroll. */
+  refused_enrollment_at?: number;
 };
+
+/** A device's lamp: waiting is neither up nor down. */
+export function deviceState(d: Device | undefined): "ok" | "warn" | "bad" | "off" {
+  if (!d || d.waiting) return "off";
+  if (d.online) return "ok";
+  return d.os_update && !d.os_update.finished_at ? "warn" : "bad";
+}
 
 export type OsUpdate = {
   version: string;

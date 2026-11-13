@@ -131,6 +131,14 @@ fn redirect_allowed(uri: &str) -> bool {
         }
 }
 
+/// A program on this machine is listening there. The page shows the link
+/// instead of following it, since the person may have approved on another
+/// machine and needs to paste it back into a terminal.
+fn to_loopback(uri: &str) -> bool {
+    uri.parse::<Uri>()
+        .is_ok_and(|u| u.scheme_str() == Some("http") && u.host().is_some_and(is_loopback))
+}
+
 /// An exact match, except that a loopback redirect may use any port: a
 /// program binds whichever is free when it starts (RFC 8252 §7.3).
 fn redirect_matches(registered: &str, presented: &str) -> bool {
@@ -360,6 +368,7 @@ pub async fn decide(
         Ok(Some(p)) => p,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    let loopback = d.allow && to_loopback(&p.redirect_uri);
     let to = if d.allow {
         match s.db.oauth_approve(id, CODE_SECS) {
             Ok(code) => {
@@ -391,7 +400,7 @@ pub async fn decide(
     );
     (
         [(header::SET_COOKIE, clear)],
-        Json(json!({ "redirect": to })),
+        Json(json!({ "redirect": to, "loopback": loopback })),
     )
         .into_response()
 }
@@ -540,6 +549,20 @@ mod tests {
         assert!(!redirect_allowed("javascript:alert(1)"));
         assert!(!redirect_allowed("/relative"));
         assert!(!redirect_allowed("https://claude.ai/cb#frag"));
+    }
+
+    #[test]
+    fn only_a_loopback_code_is_shown_to_paste() {
+        assert!(to_loopback(
+            "http://localhost:52341/callback?code=x&state=y"
+        ));
+        assert!(to_loopback("http://127.0.0.1:8/cb"));
+        assert!(to_loopback("http://[::1]:3000/cb"));
+        assert!(!to_loopback("https://localhost/cb"));
+        assert!(!to_loopback(
+            "https://claude.ai/api/mcp/auth_callback?code=x"
+        ));
+        assert!(!to_loopback("http://localhost.evil.com/cb"));
     }
 
     #[test]

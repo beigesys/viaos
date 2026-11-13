@@ -1,10 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { ago, byVersionDesc, called, duration, gb, lineage, tool, type Health, type MetricSample, type Metrics, type OsUpdate, type OsVersion } from "../lib";
+import { ago, byVersionDesc, called, duration, gb, lineage, tool, type Device, type Health, type MetricSample, type Metrics, type OsUpdate, type OsVersion } from "../lib";
 import { Terminal } from "../terminal";
-import { Button, Checkbox, Combobox, Failure, Headline, Input, Notice, Pip, Section } from "../ui";
-import { devicePath, fleetTrail, NameAndNote, TagEditor, useCan, useDevices, useFleets } from "./fleet";
+import { Button, buttonClass, Checkbox, Combobox, Copy, Failure, Headline, Input, Notice, Pip, Section } from "../ui";
+import { writeCommand } from "./enroll";
+import { devicePath, fleetPath, fleetTrail, NameAndNote, TagEditor, useCan, useDevices, useFleets } from "./fleet";
 import { ScopeVariables } from "./variables";
 import { Deployables, RunDialog, type Run } from "./releases";
 
@@ -362,6 +363,55 @@ function Storage({ m }: { m: Metrics }) {
   );
 }
 
+/** A second disk written with this device's image tried to enroll. */
+function Refused({ at }: { at?: number }) {
+  if (!at) return null;
+  return (
+    <div className="mb-4">
+      <Notice>A second device tried to enroll with this image {ago(at)}. It was refused.</Notice>
+    </div>
+  );
+}
+
+/** A device made with its image, before it has booted it. */
+function WaitingImage({ device, developer }: { device: Device; developer: boolean }) {
+  const nav = useNavigate();
+  const qc = useQueryClient();
+  const remove = useMutation({
+    mutationFn: () => tool("delete_device", { device: device.id }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["devices"] });
+      qc.invalidateQueries({ queryKey: ["images"] });
+      nav(fleetPath(device.fleet));
+    },
+  });
+  return (
+    <Section title="Image">
+      <Row k="Made" v={ago(device.enrolled_at)} />
+      {device.download || developer ? (
+        <div className="row flex-wrap gap-2 !py-2">
+          {device.download && (
+            <>
+              <a href={device.download} className={buttonClass("primary")}>
+                Download image
+              </a>
+              <Copy text={writeCommand(device.download)} label="Copy write command" />
+            </>
+          )}
+          {developer && (
+            <Button tone="danger" className="ml-auto" disabled={remove.isPending} onClick={() => confirm(`Delete ${called(device)}? Its image stops working.`) && remove.mutate()}>
+              Delete
+            </Button>
+          )}
+        </div>
+      ) : (
+        <p className="row text-sm text-ink-3">Downloading its image needs developer on {device.fleet}.</p>
+      )}
+      <Failure error={remove.error} />
+    </Section>
+  );
+}
+
 export function DevicePage() {
   const nav = useNavigate();
   const { fleet = "", device: name = "", tab: tabParam, container } = useParams();
@@ -415,6 +465,38 @@ export function DevicePage() {
       </>
     );
   }
+  if (device?.waiting) {
+    return (
+      <>
+        <Headline
+          trail={trail}
+          aside={
+            <p className="flex items-center gap-2 text-sm max-sm:hidden">
+              <Pip state="off" />
+              Waiting to enroll
+            </p>
+          }
+        >
+          {title || called(device, name)}
+        </Headline>
+        {tab === "variables" ? (
+          <ScopeVariables scope="device" target={name} inherits={lineage(fleets.data ?? [], fleet)} />
+        ) : (
+          <>
+            <Refused at={device.refused_enrollment_at} />
+            <div className="grid gap-x-4 lg:grid-cols-2 lg:items-start">
+              <WaitingImage device={device} developer={developer} />
+              <div className="min-w-0">
+                <NameAndNote key={device.id} slug={device.name} title={device.title} note={device.note} readOnly={!operator} pending={naming.isPending} error={naming.error} onSave={(c) => naming.mutate(c)} />
+                <TagEditor tags={device.tags} inherited={device.inherited_tags} known={(devices.data ?? []).flatMap((d) => d.tags)} pending={tagging.isPending} readOnly={!operator} onChange={(tags) => tagging.mutate(tags)} />
+                <Failure error={tagging.error} />
+              </div>
+            </div>
+          </>
+        )}
+      </>
+    );
+  }
   // Until the list has loaded, it isn't known to be offline.
   const unknown = !device;
   const updating = !!device?.os_update && !device.os_update.finished_at;
@@ -442,6 +524,7 @@ export function DevicePage() {
             {!unknown && (online ? `Connected · up ${duration(h?.host.uptime_secs)}` : `Not answering · last seen ${ago(device?.last_seen)}`)}
           </p>
           <Failure error={online ? health.error : null} />
+          <Refused at={device?.refused_enrollment_at} />
           {missing.length > 0 && (
             <div className="mb-4">
               <Notice>

@@ -243,7 +243,8 @@ pub struct ProvisionArgs {
     #[serde(default)]
     pub title: Option<String>,
     /// Hostname the device takes, which is also its slug. Omit to make one
-    /// from `title`, or without that to keep the name it reports.
+    /// from `title`, or without that to keep the name it reports. One
+    /// another device has, enrolled or waiting, gets `-2`, `-3`.
     #[serde(default)]
     pub hostname: Option<String>,
     /// SSH public keys allowed to log in as root.
@@ -371,7 +372,7 @@ impl Fleet {
         args: JsonObject,
         need: Level,
     ) -> anyhow::Result<CallToolResult> {
-        let d = self.device_for(device, need, &format!("`{tool}`"))?;
+        let d = enrolled(self.device_for(device, need, &format!("`{tool}`"))?)?;
         self.state.hub.call(&d.id, tool, args).await
     }
 
@@ -393,6 +394,12 @@ impl Fleet {
                 let mut v = serde_json::to_value(&d).unwrap_or_default();
                 v["online"] = json!(online);
                 v["inherited_tags"] = json!(inherited(&fleets, &d.fleet));
+                // As in list_provisioning_images: the link enrolls a device.
+                if let Some(id) = &d.image
+                    && access.can(&d.fleet, Level::Developer)
+                {
+                    v["download"] = json!(image_link(&self.state, id));
+                }
                 if let Some(u) = updates.iter().find(|u| u.device_id == d.id) {
                     v["os_update"] = json!(u);
                 }
@@ -418,7 +425,11 @@ impl Fleet {
                 );
                 Ok(d)
             }
-            (None, Some(d)) => Ok(vec![self.device_for(d, Level::Developer, "this")?]),
+            (None, Some(d)) => Ok(vec![enrolled(self.device_for(
+                d,
+                Level::Developer,
+                "this",
+            )?)?]),
             _ => anyhow::bail!("give exactly one of `fleet` or `device`"),
         }
     }
@@ -434,7 +445,10 @@ impl Fleet {
     ) -> Vec<Value> {
         let mut results = Vec::new();
         for d in devices {
-            let skip = skip(&d)
+            let skip = d
+                .waiting
+                .then(|| "waiting to enroll".to_string())
+                .or_else(|| skip(&d))
                 .or_else(|| (!self.state.hub.is_online(&d.id)).then(|| "offline".to_string()));
             let mut r = json!({ "device": d.name, "id": d.id });
             match (skip, dry_run) {
@@ -602,21 +616,45 @@ impl Fleet {
             (None, Some(t)) => Some(crate::db::slug(t)?),
             (None, None) => None,
         };
-        let token = s.db.mint_token(
+        // The device exists from here, waiting, so its slug is its own. One
+        // already taken gets the next free suffix, and the image says so.
+        let (token, device) = s.db.reserve_device(
             &a.fleet,
             hostname.as_deref(),
             a.title.as_deref().unwrap_or(""),
             30 * 24 * 3600,
-            Some(&id),
+            &id,
         )?;
+        match self.write_image(a, device_type, &base, &device, &token) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                // No image, so nothing will ever enroll as it.
+                let _ = s.db.delete_waiting_device(&device.id);
+                s.delete_image(&id);
+                Err(e)
+            }
+        }
+    }
+
+    fn write_image(
+        &self,
+        a: &ProvisionArgs,
+        device_type: &crate::db::DeviceType,
+        base: &std::path::Path,
+        device: &crate::db::Device,
+        token: &str,
+    ) -> anyhow::Result<Value> {
+        let s = &self.state;
+        let id = device.image.as_deref().expect("a waiting device");
         let mut toml = String::new();
-        if let Some(h) = &hostname {
-            toml += &format!("hostname = {}\n", toml_str(h));
+        // Unnamed, its slug is a placeholder and it keeps its own hostname.
+        if a.hostname.is_some() || a.title.is_some() {
+            toml += &format!("hostname = {}\n", toml_str(&device.name));
         }
         toml += &format!(
             "\n[control]\nurl = {}\ntoken = {}\n",
             toml_str(&s.device_url),
-            toml_str(&token)
+            toml_str(token)
         );
         if !a.ssh_keys.is_empty() {
             let keys: Vec<String> = a.ssh_keys.iter().map(|k| toml_str(k)).collect();
@@ -629,19 +667,19 @@ impl Fleet {
 
         let name = format!(
             "viaos-{}-{}-{}.raw.zst",
-            a.fleet,
-            hostname.as_deref().unwrap_or("device"),
-            device_type.id
+            a.fleet, device.name, device_type.id
         );
         std::fs::create_dir_all(s.out_dir())?;
         let out = s.out_dir().join(format!("{id}.raw.zst"));
-        image::provision(&base, &out, &toml)?;
+        image::provision(base, &out, &toml)?;
         std::fs::write(s.out_dir().join(format!("{id}.name")), &name)?;
         std::fs::write(s.out_dir().join(format!("{id}.fleet")), &a.fleet)?;
         Ok(json!({
+            "device": device.name,
+            "id": device.id,
             "file": name,
             "path": out,
-            "download": format!("{}/v1/images/{id}", s.public_url),
+            "download": image_link(s, id),
             "size_mb": std::fs::metadata(&out)?.len() / 1_048_576,
             "fleet": a.fleet,
             "device_type": device_type.id,
@@ -650,9 +688,24 @@ impl Fleet {
             "deleted_after": "the device enrolls",
             "next": "Write it to the device's disk or SD card (it is zstd-compressed; \
                      Raspberry Pi Imager and `zstdcat file | dd` both take it), then power \
-                     the device on. It appears in `list_devices` once it has booted.",
+                     the device on. It is in `list_devices` now, `waiting`; it enrolls as \
+                     that device once it has booted.",
         }))
     }
+}
+
+/// Refuse a device that is waiting to enroll: nothing runs on it yet.
+fn enrolled(d: crate::db::Device) -> anyhow::Result<crate::db::Device> {
+    anyhow::ensure!(
+        !d.waiting,
+        "{} is waiting to enroll: it has nothing to ask until its image boots",
+        d.name
+    );
+    Ok(d)
+}
+
+fn image_link(s: &State, id: &str) -> String {
+    format!("{}/v1/images/{id}", s.public_url)
 }
 
 /// A TOML basic string. serde_json's escaping is a subset of TOML's.
@@ -863,7 +916,9 @@ impl Fleet {
             if !hit {
                 continue;
             }
-            let r = if !self.state.hub.is_online(&d.id) {
+            let r = if d.waiting {
+                json!({ "device": d.name, "pending": "waiting to enroll; it gets this when it does" })
+            } else if !self.state.hub.is_online(&d.id) {
                 json!({ "device": d.name, "pending": "offline; it gets this when it reconnects" })
             } else {
                 match crate::secrets::push(&self.state, &d).await {
@@ -1081,11 +1136,39 @@ impl Fleet {
     }
 
     #[tool(
+        name = "delete_device",
+        description = "Delete a device that is waiting to enroll, with its tags and \
+                       variables. Its image's token is revoked and the image deleted, so a \
+                       disk already written with it can no longer join. An enrolled device \
+                       can't be deleted.",
+        annotations(
+            title = "Delete device",
+            read_only_hint = false,
+            destructive_hint = true
+        )
+    )]
+    async fn delete_device(
+        &self,
+        Parameters(a): Parameters<DeviceArg>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.audited("delete_device", json!({ "device": a.device }), async {
+            // Making its image took developer; so does undoing it.
+            let d = self.device_for(&a.device, Level::Developer, "deleting it")?;
+            let image = self.state.db.delete_waiting_device(&d.id)?;
+            self.state.delete_image(&image);
+            Ok(rendered(json!({ "deleted": d.name, "id": d.id })))
+        })
+        .await
+    }
+
+    #[tool(
         name = "list_devices",
         description = "Every device: name, id, fleet, its tags and those it inherits from its \
                        fleets, online now or not, last seen (unix seconds), architecture, OS and \
-                       agent version, and how its latest OS update went. Start here to find a \
-                       device. Reads only.",
+                       agent version, and how its latest OS update went. A `waiting` device \
+                       was made with its provisioning image and hasn't booted it yet; \
+                       `refused_enrollment_at` says a second disk written with its image tried \
+                       to join. Start here to find a device. Reads only.",
         annotations(title = "List devices", read_only_hint = true, open_world_hint = false)
     )]
     async fn list_devices(
@@ -1852,7 +1935,9 @@ impl Fleet {
     #[tool(
         name = "list_provisioning_images",
         description = "Provisioning images waiting to be used, and the device types images \
-                       can be made for, each `ready` if the server has a base image for it. An image disappears when its device enrolls. Reads only.",
+                       can be made for, each `ready` if the server has a base image for it. Each image names \
+                       the waiting `device` it enrolls as. An image disappears when its device \
+                       enrolls or is deleted. Reads only.",
         annotations(
             title = "List provisioning images",
             read_only_hint = true,
@@ -1871,6 +1956,8 @@ impl Fleet {
                         json!({ "id": t.id, "name": t.name, "arch": t.arch, "detail": t.detail, "ready": ready })
                     })
                     .collect();
+            let waiting: Vec<crate::db::Device> =
+                s.db.devices(None)?.into_iter().filter(|d| d.waiting).collect();
             let mut images = Vec::new();
             if let Ok(dir) = std::fs::read_dir(s.out_dir()) {
                 for e in dir.flatten() {
@@ -1894,10 +1981,13 @@ impl Fleet {
                         {
                             continue;
                         }
+                        let device = waiting.iter().find(|d| d.image.as_deref() == Some(&id));
                         images.push(json!({
+                            "device": device.map(|d| &d.name),
+                            "title": device.map(|d| &d.title),
                             "file": std::fs::read_to_string(&path).unwrap_or_default(),
                             "fleet": fleet,
-                            "download": format!("{}/v1/images/{id}", s.public_url),
+                            "download": image_link(s, &id),
                             "size_mb": meta.len() / 1_048_576,
                             "created_at": meta.modified().ok()
                                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -1966,7 +2056,10 @@ impl Fleet {
                        device. Returns where to download it. The image carries a single-use \
                        enrollment token that is never shown here: write the image to exactly \
                        one device. Make one image per device, naming its `device_type` from \
-                       `list_provisioning_images`. Takes up to a minute.",
+                       `list_provisioning_images`. The device is listed at once, `waiting`, \
+                       under the slug it will have; a slug already taken gets `-2`, `-3`. Set \
+                       its tags and variables now and it has them when it enrolls. Takes up to \
+                       a minute.",
         annotations(
             title = "Create provisioning image",
             read_only_hint = false,
@@ -2499,5 +2592,190 @@ mod tests {
         let e = crate::developer_on(&r.state, &caller(&dev), "far", "a terminal").unwrap_err();
         assert_eq!(e.to_string(), "no device named \"far\"");
         crate::developer_on(&r.state, &caller(&dev), "press", "a terminal").unwrap();
+    }
+
+    /// The smallest disk `image::provision` takes: GPT, one FAT partition
+    /// labelled `esp`.
+    fn base_image(path: &std::path::Path) {
+        const SECTOR: usize = 512;
+        let (first, sectors) = (34usize, 4096usize);
+        let mut disk = vec![0u8; (first + sectors) * SECTOR];
+        let header = &mut disk[SECTOR..2 * SECTOR];
+        header[..8].copy_from_slice(b"EFI PART");
+        header[72..80].copy_from_slice(&2u64.to_le_bytes());
+        header[80..84].copy_from_slice(&1u32.to_le_bytes());
+        header[84..88].copy_from_slice(&128u32.to_le_bytes());
+        let entry = &mut disk[2 * SECTOR..2 * SECTOR + 128];
+        entry[..16].fill(1);
+        entry[32..40].copy_from_slice(&(first as u64).to_le_bytes());
+        entry[40..48].copy_from_slice(&((first + sectors - 1) as u64).to_le_bytes());
+        for (i, c) in "esp".encode_utf16().enumerate() {
+            entry[56 + 2 * i..58 + 2 * i].copy_from_slice(&c.to_le_bytes());
+        }
+        let mut esp = std::io::Cursor::new(vec![0u8; sectors * SECTOR]);
+        fatfs::format_volume(&mut esp, fatfs::FormatVolumeOptions::new()).unwrap();
+        disk[first * SECTOR..].copy_from_slice(esp.get_ref());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, disk).unwrap();
+    }
+
+    /// The enrollment token written into an image, as the device reads it.
+    fn token_in(r: &Rig, download: &str) -> String {
+        use std::io::Read;
+        let id = download.rsplit('/').next().unwrap();
+        let out = r.state.out_dir();
+        let raw = out.join(format!("{id}.check"));
+        crate::image::decompress(&out.join(format!("{id}.raw.zst")), &raw).unwrap();
+        let fs = via_image::open_esp(&raw).unwrap();
+        let mut toml = String::new();
+        fs.root_dir()
+            .open_file("viaos.toml")
+            .unwrap()
+            .read_to_string(&mut toml)
+            .unwrap();
+        drop(fs);
+        std::fs::remove_file(raw).unwrap();
+        let line = toml.lines().find(|l| l.starts_with("token")).unwrap();
+        line.split('"').nth(1).unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn an_image_makes_a_device_that_waits_for_it() {
+        let r = rig().await;
+        base_image(&r.state.images_dir.join("viaos-x86_64.raw"));
+        let dev = r.token("dev", Some(Level::Developer), Some("line-07"));
+        let obs = r.token("obs", Some(Level::Observer), Some("line-07"));
+        let make = |title: &str| {
+            r.call(
+                &dev,
+                "create_provisioning_image",
+                json!({ "fleet": "line-07", "device_type": "pc", "title": title }),
+            )
+        };
+        // `press` is enrolled, so the image's device takes the next slug.
+        let img = make("Press").await.unwrap();
+        assert_eq!(img["device"], "press-2");
+        let download = img["download"].as_str().unwrap().to_string();
+
+        let listed = r.call(&dev, "list_devices", json!({})).await.unwrap();
+        let waiting = listed["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "press-2")
+            .unwrap()
+            .clone();
+        assert_eq!(waiting["waiting"], true);
+        assert_eq!(waiting["title"], "Press");
+        assert_eq!(waiting["download"], download.as_str());
+        // An observer sees it waiting, but not the link that enrolls it.
+        let seen = r.call(&obs, "list_devices", json!({})).await.unwrap();
+        assert!(seen["devices"][1]["download"].is_null(), "{seen}");
+
+        let e = r
+            .refused(&dev, "logs", json!({ "device": "press-2" }))
+            .await;
+        assert!(e.contains("waiting to enroll"), "{e}");
+        let e = r
+            .refused(
+                &dev,
+                "update_os",
+                json!({ "version": "2", "device": "press-2" }),
+            )
+            .await;
+        assert!(e.contains("waiting to enroll"), "{e}");
+        let caller = r.state.db.api_caller(&dev).unwrap().unwrap();
+        let e = crate::developer_on(&r.state, &caller, "press-2", "a terminal").unwrap_err();
+        assert!(e.to_string().contains("waiting to enroll"), "{e}");
+        let fleet_wide = r
+            .call(
+                &dev,
+                "update_os",
+                json!({ "version": "2", "fleet": "line-07", "dry_run": true }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            fleet_wide["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["skipped"] == "waiting to enroll"),
+            "{fleet_wide}"
+        );
+
+        // Set up while it waits; it has all of it once it enrolls.
+        r.call(
+            &dev,
+            "update_device",
+            json!({ "device": "press-2", "tags": ["site=east"], "note": "by the door" }),
+        )
+        .await
+        .unwrap();
+        r.call(
+            &dev,
+            "set_variable",
+            json!({ "app": "a", "key": "K", "device": "press-2", "value": "v" }),
+        )
+        .await
+        .unwrap();
+
+        // The link still serves the same image until it enrolls.
+        let token = token_in(&r, &download);
+        let fetched = r.http.get(&download).send().await.unwrap();
+        assert_eq!(fetched.status(), 200);
+        let enroll = || {
+            r.http
+                .post(format!("{}/v1/enroll", r.url))
+                .json(&json!({ "token": token, "hostname": "viaos", "arch": "x86_64" }))
+                .send()
+        };
+        let joined: Value = enroll().await.unwrap().json().await.unwrap();
+        assert_eq!(joined["device"]["id"], waiting["id"]);
+        assert_eq!(joined["device"]["name"], "press-2");
+        assert_eq!(joined["device"]["waiting"], false);
+        assert_eq!(joined["device"]["tags"], json!(["site=east"]));
+        assert_eq!(joined["device"]["note"], "by the door");
+        let vars = r.call(&dev, "list_variables", json!({})).await.unwrap();
+        // Stored by device id, so it still finds it.
+        assert_eq!(vars["variables"][0]["target"], "press-2", "{vars}");
+        assert_eq!(r.http.get(&download).send().await.unwrap().status(), 404);
+
+        // The same image on a second disk is turned away, and the first
+        // device says so.
+        assert_eq!(enroll().await.unwrap().status(), 403);
+        let d = r.call(&dev, "list_devices", json!({})).await.unwrap();
+        let first = d["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "press-2")
+            .unwrap();
+        assert!(first["refused_enrollment_at"].is_i64(), "{first}");
+
+        // Deleting a waiting device takes its image and token with it.
+        let img = make("Spare").await.unwrap();
+        let download = img["download"].as_str().unwrap().to_string();
+        let token = token_in(&r, &download);
+        let e = r
+            .refused(&obs, "delete_device", json!({ "device": "spare" }))
+            .await;
+        assert!(e.contains("is an observer on"), "{e}");
+        r.call(&dev, "delete_device", json!({ "device": "spare" }))
+            .await
+            .unwrap();
+        assert_eq!(r.http.get(&download).send().await.unwrap().status(), 404);
+        let refused = r
+            .http
+            .post(format!("{}/v1/enroll", r.url))
+            .json(&json!({ "token": token, "hostname": "spare" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 403);
+        let e = r
+            .refused(&dev, "delete_device", json!({ "device": "press-2" }))
+            .await;
+        assert!(e.contains("only a device waiting"), "{e}");
     }
 }
