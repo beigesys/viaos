@@ -88,10 +88,27 @@ impl Secrets {
         [nonce.as_slice(), &sealed].concat()
     }
 
+    /// A GitHub token kept so a connection can be checked again.
+    pub fn seal_github(&self, token: &str) -> Vec<u8> {
+        self.seal("oauth", "github", "", None, "token", token)
+    }
+
+    pub fn open_github(&self, sealed: &[u8]) -> Result<String> {
+        self.open_sealed(
+            sealed,
+            &Self::binding("oauth", "github", "", None, "token"),
+            "the GitHub token",
+        )
+    }
+
     fn open_value(&self, v: &Variable) -> Result<String> {
-        ensure!(v.value.len() > NONCE, "stored secret is too short");
-        let (nonce, sealed) = v.value.split_at(NONCE);
         let aad = Self::binding(&v.scope, &v.target, &v.app, v.service.as_deref(), &v.key);
+        self.open_sealed(&v.value, &aad, &v.key)
+    }
+
+    fn open_sealed(&self, value: &[u8], aad: &str, what: &str) -> Result<String> {
+        ensure!(value.len() > NONCE, "stored secret is too short");
+        let (nonce, sealed) = value.split_at(NONCE);
         let plain = self
             .cipher
             .decrypt(
@@ -101,7 +118,7 @@ impl Secrets {
                     aad: aad.as_bytes(),
                 },
             )
-            .map_err(|_| anyhow::anyhow!("cannot open secret {}: wrong key or altered", v.key))?;
+            .map_err(|_| anyhow::anyhow!("cannot open secret {what}: wrong key or altered"))?;
         Ok(String::from_utf8(plain)?)
     }
 }
@@ -118,11 +135,15 @@ pub struct Resolved {
 /// device, device for one service. A device's value beats a fleet's even when
 /// the fleet's is aimed at one service, so it clears those as it lands. Each
 /// service's value then only has to win over `apps`, however a release uses it.
+///
+/// A variable with no app is for every app in `apps`, and at each level
+/// gives way to one set for the app itself.
 pub fn resolve(
     secrets: &Secrets,
     vars: &[Variable],
     device: &Device,
     fleets: &[String],
+    apps: &[String],
 ) -> Result<Resolved> {
     let mut out = Resolved::default();
     // Weakest first: the outermost fleet, on in to the device's own.
@@ -134,10 +155,13 @@ pub fn resolve(
     layers.push(("device", &device.id, false));
     layers.push(("device", &device.id, true));
     for (scope, target, scoped) in layers {
-        for v in vars
+        let mut here: Vec<&Variable> = vars
             .iter()
             .filter(|v| v.scope == scope && &v.target == target && v.service.is_some() == scoped)
-        {
+            .collect();
+        // Every app's values first, so the app's own land on top.
+        here.sort_by_key(|v| !v.app.is_empty());
+        for v in here {
             let value = if v.secret {
                 secrets.open_value(v)?
             } else {
@@ -145,16 +169,19 @@ pub fn resolve(
             };
             match &v.service {
                 None => {
-                    if let Some(services) = out.services.get_mut(&v.app) {
-                        for values in services.values_mut() {
-                            values.remove(&v.key);
+                    let every = std::slice::from_ref(&v.app);
+                    for app in if v.app.is_empty() { apps } else { every } {
+                        if let Some(services) = out.services.get_mut(app) {
+                            for values in services.values_mut() {
+                                values.remove(&v.key);
+                            }
+                            services.retain(|_, values| !values.is_empty());
                         }
-                        services.retain(|_, values| !values.is_empty());
+                        out.apps
+                            .entry(app.clone())
+                            .or_default()
+                            .insert(v.key.clone(), value.clone());
                     }
-                    out.apps
-                        .entry(v.app.clone())
-                        .or_default()
-                        .insert(v.key.clone(), value);
                 }
                 Some(service) => {
                     out.services
@@ -174,7 +201,22 @@ pub fn resolve(
 /// Send a device everything it should hold.
 pub async fn push(state: &State, device: &Device) -> Result<Value> {
     let fleets = state.db.fleet_lineage(&device.fleet)?;
-    let resolved = resolve(&state.secrets, &state.db.variables()?, device, &fleets)?;
+    let root = state.releases_dir();
+    let mut apps: Vec<String> =
+        tokio::task::spawn_blocking(move || crate::releases::list(&root, None))
+            .await?
+            .into_iter()
+            .map(|r| r.app)
+            .collect();
+    apps.sort();
+    apps.dedup();
+    let resolved = resolve(
+        &state.secrets,
+        &state.db.variables()?,
+        device,
+        &fleets,
+        &apps,
+    )?;
     let mut args = JsonObject::new();
     args.insert("apps".into(), json!(resolved.apps));
     args.insert("services".into(), json!(resolved.services));
@@ -213,6 +255,7 @@ mod tests {
         Device {
             id: "d1".into(),
             name: "line-07".into(),
+            title: String::new(),
             fleet: "lab".into(),
             arch: None,
             os_version: None,
@@ -220,6 +263,7 @@ mod tests {
             enrolled_at: 0,
             last_seen: None,
             tags: Vec::new(),
+            note: String::new(),
         }
     }
 
@@ -244,6 +288,34 @@ mod tests {
     }
 
     #[test]
+    fn a_value_for_every_app_gives_way_to_the_apps_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Secrets::open(dir.path(), None).unwrap();
+        let every = |key: &str, value: &str| {
+            let mut v = var(key, value.as_bytes().to_vec(), false);
+            v.app = String::new();
+            v
+        };
+        let mut device_wide = every("SITE", "dallas-line-3");
+        device_wide.scope = "device".into();
+        device_wide.target = "d1".into();
+        let vars = vec![
+            every("SITE", "dallas"),
+            every("MODE", "every"),
+            var("MODE", b"hello's own".to_vec(), false),
+            device_wide,
+        ];
+        let apps = ["hello".to_string(), "other".to_string()];
+        let env = resolve(&s, &vars, &device(), &["lab".to_string()], &apps).unwrap();
+        // The fleet's value for one app beats the fleet's for every app,
+        assert_eq!(env.apps["hello"]["MODE"], "hello's own");
+        assert_eq!(env.apps["other"]["MODE"], "every");
+        // and the device's for every app beats the fleet's.
+        assert_eq!(env.apps["hello"]["SITE"], "dallas-line-3");
+        assert_eq!(env.apps["other"]["SITE"], "dallas-line-3");
+    }
+
+    #[test]
     fn a_devices_value_beats_its_fleets() {
         let dir = tempfile::tempdir().unwrap();
         let s = Secrets::open(dir.path(), None).unwrap();
@@ -258,7 +330,7 @@ mod tests {
             other,
             var("REGION", b"us".to_vec(), false),
         ];
-        let env = resolve(&s, &vars, &device(), &["lab".to_string()]).unwrap();
+        let env = resolve(&s, &vars, &device(), &["lab".to_string()], &[]).unwrap();
         assert_eq!(env.apps["hello"]["MODE"], "device");
         assert_eq!(env.apps["hello"]["REGION"], "us");
     }
@@ -274,14 +346,14 @@ mod tests {
         };
         let lineage = ["acme".to_string(), "lab".to_string()];
         let mode = |vars: &[Variable]| {
-            resolve(&s, vars, &device(), &lineage).unwrap().apps["hello"]["MODE"].clone()
+            resolve(&s, vars, &device(), &lineage, &[]).unwrap().apps["hello"]["MODE"].clone()
         };
         assert_eq!(mode(&[at("acme", "outer")]), "outer");
         assert_eq!(mode(&[at("lab", "inner"), at("acme", "outer")]), "inner");
         // A service-scoped value further out doesn't outrank a nearer fleet's.
         let mut scoped = at("acme", "outer-web");
         scoped.service = Some("web".into());
-        let r = resolve(&s, &[scoped, at("lab", "inner")], &device(), &lineage).unwrap();
+        let r = resolve(&s, &[scoped, at("lab", "inner")], &device(), &lineage, &[]).unwrap();
         assert_eq!(r.apps["hello"]["MODE"], "inner");
         assert!(
             r.services
@@ -290,7 +362,7 @@ mod tests {
         );
         // A fleet elsewhere in the tree doesn't reach it.
         assert!(
-            resolve(&s, &[at("sibling", "no")], &device(), &lineage)
+            resolve(&s, &[at("sibling", "no")], &device(), &lineage, &[])
                 .unwrap()
                 .apps
                 .is_empty()
@@ -310,7 +382,7 @@ mod tests {
     fn seen(vars: &[Variable]) -> (Option<String>, Option<String>) {
         let dir = tempfile::tempdir().unwrap();
         let s = Secrets::open(dir.path(), None).unwrap();
-        let r = resolve(&s, vars, &device(), &["lab".to_string()]).unwrap();
+        let r = resolve(&s, vars, &device(), &["lab".to_string()], &[]).unwrap();
         let get = |service: &str| {
             r.services
                 .get("hello")

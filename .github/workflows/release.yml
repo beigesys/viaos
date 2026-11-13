@@ -1,19 +1,29 @@
 # Push a tag `v<N>` where N is the number in VERSION: builds both
-# architectures, signs the OS updates, and publishes them and the base images
-# to your control plane. Needs repository secrets:
+# architectures and attaches them to the GitHub release for that tag:
 #
-#   VIA_SERVER       https://via.example.com
-#   VIA_TOKEN        an admin token: `via-server token create ci`
-#   VIA_SIGNING_KEY  the contents of ~/.config/via/signing.key
-#   VIA_SECURE_BOOT_KEYS  `tar -C ~/.config/via/secure-boot -c . | base64 -w0`
+#   viaos-<arch>.raw.zst     the base image provisioning images are made from;
+#                            every control plane fetches it when it has none
+#   viaos-update-<arch>.tar  the OS update, for `via os-release`
+#
+# Images are plain: nothing is signed unless keys are given. Optional
+# repository secrets:
+#
+#   VIA_SERVER, VIA_TOKEN  also publish to that control plane (an admin token)
+#   VIA_SIGNING_KEY        sign updates, for servers that set VIA_TRUSTED_KEYS
+#   VIA_SECURE_BOOT_KEYS   `tar -C <keys> -c . | base64 -w0`: sign what goes to
+#                          that control plane for Secure Boot (the release's
+#                          own files stay plain)
 name: release
 
 on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: write
+
 jobs:
-  publish:
+  build:
     strategy:
       matrix:
         include:
@@ -22,6 +32,10 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    # Here, not on the step, so the step's `if` can see whether it's set.
+    env:
+      VIA_SERVER: ${{ secrets.VIA_SERVER }}
+      VIA_TOKEN: ${{ secrets.VIA_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - name: The tag matches VERSION
@@ -35,19 +49,39 @@ jobs:
       - run: nix build .#via -o via
       - run: nix build .#images.${{ matrix.arch }} -o image
       - run: nix build .#updates.${{ matrix.arch }} -o update
-      - name: Publish
+      - name: Keys, if any
         env:
-          VIA_SERVER: ${{ secrets.VIA_SERVER }}
-          VIA_TOKEN: ${{ secrets.VIA_TOKEN }}
           VIA_SIGNING_KEY_HEX: ${{ secrets.VIA_SIGNING_KEY }}
           SECURE_BOOT_TAR: ${{ secrets.VIA_SECURE_BOOT_KEYS }}
         run: |
           umask 077
-          printf '%s\n' "$VIA_SIGNING_KEY_HEX" > "$RUNNER_TEMP/key"
-          # Not optional: a runner making its own keys would sign with ones no device has.
-          mkdir "$RUNNER_TEMP/sb"
-          printf '%s' "${SECURE_BOOT_TAR:?set the VIA_SECURE_BOOT_KEYS secret}" | base64 -d | tar -C "$RUNNER_TEMP/sb" -x
-          export VIA_SECURE_BOOT_KEYS="$RUNNER_TEMP/sb"
-          via/bin/via os-release update --sign-key "$RUNNER_TEMP/key"
-          via/bin/via base-image image/viaos_$(cat VERSION).raw --arch ${{ matrix.arch }}
-          rm -rf "$RUNNER_TEMP/key" "$RUNNER_TEMP/sb"
+          if [ -n "$VIA_SIGNING_KEY_HEX" ]; then
+            printf '%s\n' "$VIA_SIGNING_KEY_HEX" > "$RUNNER_TEMP/key"
+            echo "VIA_SIGNING_KEY=$RUNNER_TEMP/key" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$SECURE_BOOT_TAR" ]; then
+            mkdir "$RUNNER_TEMP/sb"
+            printf '%s' "$SECURE_BOOT_TAR" | base64 -d | tar -C "$RUNNER_TEMP/sb" -x
+            echo "VIA_SECURE_BOOT_KEYS=$RUNNER_TEMP/sb" >> "$GITHUB_ENV"
+          fi
+      - name: Release files
+        run: |
+          mkdir out
+          zstd -T0 -6 "image/viaos_$(cat VERSION).raw" -o out/viaos-${{ matrix.arch }}.raw.zst
+          tar -C update -chf out/viaos-update-${{ matrix.arch }}.tar .
+          ls -la out
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "viaos $(cat VERSION)" --notes "" \
+            || true
+          gh release upload "$GITHUB_REF_NAME" out/* --clobber
+      - name: Publish to a control plane
+        if: env.VIA_SERVER != ''
+        run: |
+          via/bin/via os-release update
+          via/bin/via base-image "image/viaos_$(cat VERSION).raw" --arch ${{ matrix.arch }}
+      - if: always()
+        run: rm -rf "$RUNNER_TEMP/key" "$RUNNER_TEMP/sb"

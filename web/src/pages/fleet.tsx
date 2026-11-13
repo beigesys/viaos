@@ -1,9 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { ago, atLeast, fleetTags, hasTag, lineage, tagChoices, tool, under, type Device, type Fleet, type Level } from "../lib";
+import { ago, atLeast, called, fleetTags, hasTag, lineage, slug, tagChoices, tool, under, type Device, type Fleet, type Level } from "../lib";
 import { useIsAdmin } from "../main";
-import { Button, buttonClass, Combobox, Empty, Failure, Field, Headline, Input, Modal, Pip, Readout, Section, Tag } from "../ui";
+import { Button, buttonClass, Combobox, Empty, Failure, Field, Headline, Input, Modal, Pip, Readout, Section, Tag, Textarea } from "../ui";
 import { useRunning } from "./catalog";
 import { EnrollTab } from "./enroll";
 import { Deployables } from "./releases";
@@ -36,7 +36,8 @@ export function useCan(fleet: string | undefined, need: Level) {
 export function fleetTrail(fleets: Fleet[] | undefined, fleet: string, include: boolean): [string, string][] {
   const chain = lineage(fleets ?? [], fleet);
   const names = chain.length ? chain : [fleet];
-  return [["Fleets", "/"], ...(include ? names : names.slice(0, -1)).map((f): [string, string] => [f, fleetPath(f)])];
+  const label = (f: string) => called(fleets?.find((x) => x.name === f), f);
+  return [["Fleets", "/"], ...(include ? names : names.slice(0, -1)).map((f): [string, string] => [label(f), fleetPath(f)])];
 }
 
 export const fleetPath = (fleet: string) => `/fleets/${encodeURIComponent(fleet)}`;
@@ -47,12 +48,14 @@ function AddFleet({ primary, parent }: { primary?: boolean; parent?: string }) {
   const nav = useNavigate();
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
+  const made = slug(name);
   const create = useMutation({
-    mutationFn: () => tool("create_fleet", { fleet: name.trim(), ...(parent ? { parent } : {}) }),
-    onSuccess: () => {
+    mutationFn: () => tool<{ fleet: string }>("create_fleet", { title: name.trim(), ...(parent ? { parent } : {}) }),
+    onSuccess: (r) => {
       qc.invalidateQueries({ queryKey: ["fleets"] });
       setOpen(false);
-      nav(fleetPath(name.trim()));
+      setName("");
+      nav(fleetPath(r.fleet));
     },
   });
   const title = parent ? `Add a fleet under ${parent}` : "Add fleet";
@@ -70,13 +73,13 @@ function AddFleet({ primary, parent }: { primary?: boolean; parent?: string }) {
               create.mutate();
             }}
           >
-            <Field label="Name" hint="A customer, a site, a building, a line: whatever this level means to you. Unique across the whole tree.">
-              <Input autoFocus aria-label="New fleet name" placeholder="acme" value={name} onChange={(e) => setName(e.target.value)} />
+            <Field label="Name" hint={made ? <>Slug <span className="font-mono">{made}</span>, for tools and links. It never changes, and no two fleets share one.</> : "A customer, a site, a building, a line: whatever this level means to you."}>
+              <Input autoFocus aria-label="New fleet name" placeholder="Acme, Dallas plant" value={name} onChange={(e) => setName(e.target.value)} />
             </Field>
             <Failure error={create.error} />
             <div className="flex justify-end gap-2">
               <Button onClick={() => setOpen(false)}>Cancel</Button>
-              <Button tone="primary" type="submit" disabled={!name.trim() || create.isPending}>
+              <Button tone="primary" type="submit" disabled={!made || create.isPending}>
                 Add
               </Button>
             </div>
@@ -112,10 +115,11 @@ function FleetTable({ rows, all, devices, showPath }: { rows: Fleet[]; all: Flee
             return (
               <tr key={f.name} onClick={() => nav(fleetPath(f.name))} className="h-10 cursor-pointer border-b border-rule transition-colors last:border-b-0 hover:bg-well max-sm:h-11">
                 <td className="truncate px-3">
-                  {showPath && above.length > 0 && <span className="font-mono text-xs text-ink-3">{above.join(" / ")} / </span>}
-                  <Link to={fleetPath(f.name)} onClick={(e) => e.stopPropagation()} className="font-mono font-semibold">
-                    {f.name}
+                  {showPath && above.length > 0 && <span className="text-xs text-ink-3">{above.map((a) => called(all.find((x) => x.name === a), a)).join(" / ")} / </span>}
+                  <Link to={fleetPath(f.name)} onClick={(e) => e.stopPropagation()} className={`font-semibold ${f.title ? "" : "font-mono"}`}>
+                    {called(f)}
                   </Link>
+                  {f.title && <span className="ml-2 font-mono text-xs text-ink-3 max-sm:hidden">{f.name}</span>}
                   {kids > 0 && <span className="ml-2 font-mono text-xs text-ink-3">+{kids}</span>}
                 </td>
                 <td className="truncate px-3 max-sm:hidden">
@@ -152,8 +156,8 @@ export function FleetsPage() {
   const q = text.trim().toLowerCase();
   const searching = !!q || wanted.length > 0;
   const matches = (tags: string[], words: string) => wanted.every((w) => hasTag(tags, w)) && `${words} ${tags.join(" ")}`.toLowerCase().includes(q);
-  const rows = searching ? all.filter((f) => matches(fleetTags(all, f.name), lineage(all, f.name).join(" "))) : all.filter((f) => !f.parent);
-  const found = searching ? allDevices.filter((d) => matches([...d.tags, ...(d.inherited_tags ?? [])], `${d.name} ${d.fleet}`)) : [];
+  const rows = searching ? all.filter((f) => matches(fleetTags(all, f.name), `${lineage(all, f.name).join(" ")} ${f.title} ${f.note}`)) : all.filter((f) => !f.parent);
+  const found = searching ? allDevices.filter((d) => matches([...d.tags, ...(d.inherited_tags ?? [])], `${d.name} ${d.title} ${d.note} ${d.fleet}`)) : [];
   return (
     <>
       <Headline aside={admin ? <AddFleet primary={fleets.isSuccess && all.length === 0} /> : undefined}>Fleets</Headline>
@@ -226,6 +230,65 @@ export function TagEditor({ tags, inherited = [], known, pending, readOnly, onCh
   );
 }
 
+/** What people call a fleet or device, and what they should know about it. */
+export function NameAndNote({ slug: s, title, note, readOnly, pending, error, onSave }: { slug: string; title: string; note: string; readOnly?: boolean; pending: boolean; error: unknown; onSave: (change: { title?: string; note?: string }) => void }) {
+  const [draftTitle, setDraftTitle] = useState<string | null>(null);
+  const [draftNote, setDraftNote] = useState<string | null>(null);
+  const t = draftTitle ?? title;
+  const n = draftNote ?? note;
+  return (
+    <>
+      <Section title="Name">
+        {readOnly ? (
+          <div className="row justify-between gap-4 text-sm">
+            <span className="min-w-0 truncate">{title || "–"}</span>
+            <span className="font-mono text-xs text-ink-3">{s}</span>
+          </div>
+        ) : (
+          <form
+            className="row gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              onSave({ title: t.trim() });
+              setDraftTitle(null);
+            }}
+          >
+            <Input aria-label="Name" className="flex-1" placeholder={s} value={t} maxLength={100} onChange={(e) => setDraftTitle(e.target.value)} />
+            <Button type="submit" size="sm" disabled={pending || t.trim() === title}>
+              Save
+            </Button>
+          </form>
+        )}
+        <p className="row text-xs text-ink-3">
+          Slug <span className="ml-1 font-mono">{s}</span>
+        </p>
+      </Section>
+      <Section title="Note">
+        {readOnly ? (
+          <p className="row text-sm whitespace-pre-wrap">{note || <span className="text-ink-3">No note</span>}</p>
+        ) : (
+          <form
+            className="space-y-2 py-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              onSave({ note: n.trim() });
+              setDraftNote(null);
+            }}
+          >
+            <Textarea aria-label="Note" rows={Math.min(16, Math.max(4, n.split("\n").length + 1))} className="w-full" placeholder="How it's wired, quirks, who to call, what fixed it last time. Claude reads this too." value={n} maxLength={10000} onChange={(e) => setDraftNote(e.target.value)} />
+            <div className="flex justify-end">
+              <Button type="submit" size="sm" disabled={pending || n.trim() === note}>
+                Save note
+              </Button>
+            </div>
+          </form>
+        )}
+      </Section>
+      <Failure error={error} />
+    </>
+  );
+}
+
 function SettingsTab({ fleet, fleets }: { fleet: string; fleets: Fleet[] }) {
   const qc = useQueryClient();
   const nav = useNavigate();
@@ -255,6 +318,9 @@ function SettingsTab({ fleet, fleets }: { fleet: string; fleets: Fleet[] }) {
   const known = fleets.flatMap((f) => f.tags);
   return (
     <div className="grid gap-x-4 lg:grid-cols-2 lg:items-start">
+      <div className="lg:col-span-2">
+        <NameAndNote key={me.name} slug={me.name} title={me.title} note={me.note} pending={update.isPending} error={null} onSave={(c) => update.mutate(c)} />
+      </div>
       <TagEditor tags={me.tags} known={known} pending={update.isPending} onChange={(tags) => update.mutate({ tags })} />
       <Section title="Sits under">
         <div className="row gap-2">
@@ -265,7 +331,7 @@ function SettingsTab({ fleet, fleets }: { fleet: string; fleets: Fleet[] }) {
             value={me.parent ?? ""}
             disabled={update.isPending || !placeable(me.parent)}
             onChange={(p) => p !== (me.parent ?? "") && update.mutate(p ? { parent: p } : { top_level: true })}
-            options={[...(admin ? [{ value: "", label: "Nothing (top level)" }] : []), ...fleets.filter((f) => !inside.includes(f.name) && placeable(f.name)).map((f) => ({ value: f.name, label: f.name, detail: lineage(fleets, f.name).slice(0, -1).join(" / ") || undefined }))]}
+            options={[...(admin ? [{ value: "", label: "Nothing (top level)" }] : []), ...fleets.filter((f) => !inside.includes(f.name) && placeable(f.name)).map((f) => ({ value: f.name, label: called(f), detail: lineage(fleets, f.name).slice(0, -1).map((a) => called(fleets.find((x) => x.name === a), a)).join(" / ") || undefined }))]}
           />
         </div>
       </Section>
@@ -275,7 +341,7 @@ function SettingsTab({ fleet, fleets }: { fleet: string; fleets: Fleet[] }) {
       <Section title="Delete">
         <div className="row justify-between gap-3">
           <span className="min-w-0 text-sm text-ink-2">{!empty ? "Not empty, so it can't be deleted" : canDelete ? "Empty" : me.parent ? `Deleting it needs developer on ${me.parent}` : "Deleting it needs an admin"}</span>
-          <Button tone="danger" size="sm" disabled={!canDelete || remove.isPending} onClick={() => confirm(`Delete fleet ${fleet}?`) && remove.mutate()}>
+          <Button tone="danger" size="sm" disabled={!canDelete || remove.isPending} onClick={() => confirm(`Delete fleet ${called(me)}?`) && remove.mutate()}>
             Delete fleet
           </Button>
         </div>
@@ -287,8 +353,8 @@ function SettingsTab({ fleet, fleets }: { fleet: string; fleets: Fleet[] }) {
 function DevicesTab({ fleet, devices, loaded, canEnroll, hasChildren }: { fleet: string; devices: Device[]; loaded: boolean; canEnroll: boolean; hasChildren: boolean }) {
   const [filter, setFilter] = useState("");
   const shown = devices
-    .filter((d) => !filter || `${d.name} ${d.arch} ${d.os_version} ${d.tags.join(" ")}`.toLowerCase().includes(filter.toLowerCase()))
-    .sort((a, b) => Number(a.online) - Number(b.online) || a.name.localeCompare(b.name));
+    .filter((d) => !filter || `${d.name} ${d.title} ${d.arch} ${d.os_version} ${d.tags.join(" ")}`.toLowerCase().includes(filter.toLowerCase()))
+    .sort((a, b) => Number(a.online) - Number(b.online) || called(a).localeCompare(called(b)));
   if (loaded && devices.length === 0 && hasChildren) return null;
   if (loaded && devices.length === 0) {
     return (
@@ -334,8 +400,9 @@ function DeviceTable({ devices, all, showFleet }: { devices: Device[]; all?: Fle
                 <div className="flex items-center gap-2.5">
                   <Pip state={d.online ? "ok" : d.os_update && !d.os_update.finished_at ? "warn" : "bad"} />
                   <div className="min-w-0">
-                    <Link to={devicePath(d.fleet, d.name)} onClick={(e) => e.stopPropagation()} className="block truncate font-mono font-semibold">
-                      {d.name}
+                    <Link to={devicePath(d.fleet, d.name)} onClick={(e) => e.stopPropagation()} className={`block truncate font-semibold ${d.title ? "" : "font-mono"}`}>
+                      {called(d)}
+                      {d.title && <span className="ml-2 font-mono text-xs font-normal text-ink-3 max-sm:hidden">{d.name}</span>}
                     </Link>
                     <span className="block truncate font-mono text-xs text-ink-3 sm:hidden">
                       {d.arch ?? "–"} · os {d.os_version ?? "–"}
@@ -351,7 +418,7 @@ function DeviceTable({ devices, all, showFleet }: { devices: Device[]; all?: Fle
                   {showFleet && (d.inherited_tags ?? []).filter((t) => !d.tags.includes(t)).map((t) => <Tag key={t} tag={t} quiet />)}
                 </span>
               </td>
-              {showFleet && <td className="truncate px-3 font-mono text-xs text-ink-2 max-sm:hidden">{lineage(all ?? [], d.fleet).join(" / ")}</td>}
+              {showFleet && <td className="truncate px-3 text-xs text-ink-2 max-sm:hidden">{lineage(all ?? [], d.fleet).map((a) => called(all?.find((x) => x.name === a), a)).join(" / ")}</td>}
               <td className="px-3 font-mono text-xs text-ink-2 max-md:hidden">{d.arch ?? "–"}</td>
               <td className="px-3 font-mono text-xs max-sm:hidden">{d.os_version ?? "–"}</td>
               <td className="px-3 font-mono text-xs text-ink-2 max-md:hidden">{d.agent_version ?? "–"}</td>
@@ -382,6 +449,7 @@ export function FleetPage() {
   const children = all.filter((f) => f.parent === fleet);
   const on = everything.filter((d) => d.online).length;
   const off = everything.length - on;
+  const me = all.find((f) => f.name === fleet);
 
   if (fleets.isSuccess && !fleets.data.some((f) => f.name === fleet)) {
     return (
@@ -416,11 +484,12 @@ export function FleetPage() {
           </>
         }
       >
-        {title ?? fleet}
+        {title ?? called(me, fleet)}
       </Headline>
       <Failure error={devices.error} />
       {(!tab || tab === "devices") && (
         <>
+          {me?.note && <p className="mb-4 border-l-2 border-rule-strong pl-3 text-sm whitespace-pre-wrap text-ink-2">{me.note}</p>}
           {children.length > 0 && <FleetTable rows={children} all={all} devices={devices.data ?? []} />}
           <DevicesTab fleet={fleet} devices={mine} loaded={devices.isSuccess} canEnroll={developer} hasChildren={children.length > 0} />
         </>

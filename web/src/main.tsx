@@ -9,6 +9,7 @@ import { Audit } from "./pages/audit";
 import { AppPage, AppsPage, OsPage, OsVersionPage, ReleasePage } from "./pages/catalog";
 import { DevicePage } from "./pages/device";
 import { FleetPage, FleetsPage } from "./pages/fleet";
+import { Connect } from "./pages/connect";
 import { Login } from "./pages/login";
 import { Sidebar } from "./sidebar";
 import { Button, Menu } from "./ui";
@@ -90,6 +91,12 @@ function Shell({ me, children }: { me: Caller; children: ReactNode }) {
 }
 
 function App() {
+  // An MCP client's sign-in, which needs no console session.
+  if (location.pathname === "/connect") return <Connect />;
+  return <Console />;
+}
+
+function Console() {
   const session = useQuery({ queryKey: ["session"], queryFn: whoami, staleTime: 60_000 });
   if (session.isPending) return null;
   if (!session.data) return <Login />;

@@ -35,6 +35,8 @@ const ADMIN_TOOLS: &[&str] = &[
     "list_tokens",
     "create_token",
     "revoke_token",
+    "list_connections",
+    "revoke_connection",
     "list_grants",
     "set_grant",
     "delete_grant",
@@ -47,7 +49,11 @@ You manage a fleet of viaos edge devices. `list_devices` is the map: every \
 device with its fleet, whether it is online, and its OS version. For how a \
 device is doing, call `device_health` with its name; follow with `logs` or \
 `journal`; `exec` runs a command on the device when those do not answer \
-the question. For OS upgrades, `list_os_versions` then `update_os`; for apps, `list_releases` then \
+the question. Fleets and devices carry a `note` (in `list_fleets` and \
+`list_devices`): read a device's and its fleets' notes before troubleshooting \
+it, and when you learn something the next person would want (wiring, quirks, \
+what fixed it), add it with `update_device` or `update_fleet`, keeping what \
+was there. For OS upgrades, `list_os_versions` then `update_os`; for apps, `list_releases` then \
 `deploy`. Both take dry_run: use it first. A release's bare `- KEY` environment \
 entries are filled from `set_variable`, per fleet or device and optionally per \
 service; `list_variables` shows what each app takes. Never ask for a real secret in chat -- \
@@ -78,8 +84,13 @@ pub struct DeleteFleetArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CreateFleetArgs {
-    /// Fleet name, unique across the whole tree.
-    pub fleet: String,
+    /// What people call it, e.g. `Line 7, Plant 2`.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Its slug, unique across the whole tree: lowercase letters, digits and
+    /// dashes. Omit to make one from `title`.
+    #[serde(default)]
+    pub fleet: Option<String>,
     /// The fleet to put it under, e.g. a customer or site. Omit for the top.
     #[serde(default)]
     pub parent: Option<String>,
@@ -92,8 +103,16 @@ pub struct CreateFleetArgs {
 pub struct UpdateDeviceArgs {
     /// Device name or id.
     pub device: String,
-    /// Its tags, replacing the ones it has: `key` or `key=value`.
-    pub tags: Vec<String>,
+    /// Its tags, replacing the ones it has: `key` or `key=value`. Omit to
+    /// leave them.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    /// What people call it; empty goes back to its slug. Omit to leave it.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Its note, replacing the one it has; empty clears it. Omit to leave it.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -108,6 +127,12 @@ pub struct UpdateFleetArgs {
     /// Replace its tags with these. Omit to leave them.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// What people call it; empty goes back to its slug. Omit to leave it.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Its note, replacing the one it has; empty clears it. Omit to leave it.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -214,7 +239,11 @@ pub struct ProvisionArgs {
     /// device type with that architecture.
     #[serde(default)]
     pub arch: Option<String>,
-    /// Name the device takes. Omit to keep the name it reports.
+    /// What people will call the device, e.g. `Packing scale`.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Hostname the device takes, which is also its slug. Omit to make one
+    /// from `title`, or without that to keep the name it reports.
     #[serde(default)]
     pub hostname: Option<String>,
     /// SSH public keys allowed to log in as root.
@@ -558,15 +587,30 @@ impl Fleet {
         } else {
             self.access()?
                 .require_admin("making a new fleet at the top level")?;
+            anyhow::ensure!(
+                crate::db::slug(&a.fleet)? == a.fleet,
+                "a new fleet's slug is lowercase letters, digits and dashes, like {:?}",
+                crate::db::slug(&a.fleet)?
+            );
         }
         s.db.create_fleet(&a.fleet)?;
         // The token goes into the image and nowhere else: not into this
         // result, the audit log, or the server's own log.
         let id = crate::db::random_secret()[..24].to_string();
-        let token =
-            s.db.mint_token(&a.fleet, a.hostname.as_deref(), 30 * 24 * 3600, Some(&id))?;
+        let hostname = match (&a.hostname, &a.title) {
+            (Some(h), _) => Some(crate::db::slug(h)?),
+            (None, Some(t)) => Some(crate::db::slug(t)?),
+            (None, None) => None,
+        };
+        let token = s.db.mint_token(
+            &a.fleet,
+            hostname.as_deref(),
+            a.title.as_deref().unwrap_or(""),
+            30 * 24 * 3600,
+            Some(&id),
+        )?;
         let mut toml = String::new();
-        if let Some(h) = &a.hostname {
+        if let Some(h) = &hostname {
             toml += &format!("hostname = {}\n", toml_str(h));
         }
         toml += &format!(
@@ -586,7 +630,7 @@ impl Fleet {
         let name = format!(
             "viaos-{}-{}-{}.raw.zst",
             a.fleet,
-            a.hostname.as_deref().unwrap_or("device"),
+            hostname.as_deref().unwrap_or("device"),
             device_type.id
         );
         std::fs::create_dir_all(s.out_dir())?;
@@ -618,7 +662,9 @@ fn toml_str(s: &str) -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct VariableArgs {
-    /// App the variable is for, as in `list_releases`.
+    /// App the variable is for, as in `list_releases`. Omit for every app:
+    /// the value goes to whichever services of any app declare the name.
+    #[serde(default)]
     pub app: String,
     /// Variable name, as the compose file declares it.
     pub key: String,
@@ -664,6 +710,8 @@ pub struct VariableName {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct UpdateVariablesArgs {
+    /// App the variables are for. Omit for every app.
+    #[serde(default)]
     pub app: String,
     /// Every device in this fleet. Give this or `device`.
     #[serde(default)]
@@ -701,6 +749,12 @@ pub struct TokenNameArg {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ConnectionArg {
+    /// The connection's id, from `list_connections`.
+    pub id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateTokenArgs {
     /// Who or what the token is for.
     pub name: String,
@@ -781,6 +835,10 @@ impl Fleet {
 
     fn check_service(a: &VariableArgs) -> anyhow::Result<()> {
         if let Some(s) = &a.service {
+            anyhow::ensure!(
+                !a.app.is_empty(),
+                "a service belongs to one app: give `app` with `service`"
+            );
             via_core::ServiceName::parse(s.clone())
                 .map_err(|_| anyhow::anyhow!("{s:?} is not a service name"))?;
         }
@@ -855,8 +913,10 @@ impl Fleet {
 
     #[tool(
         name = "create_fleet",
-        description = "Create an empty fleet, optionally under another and with tags. Devices \
-                       join it through a provisioning image. Does nothing if it already exists.",
+        description = "Create an empty fleet from a `title` people read, optionally under \
+                       another and with tags; its slug is made from the title unless you give \
+                       `fleet`. Devices join it through a provisioning image. Does nothing if \
+                       the slug already exists.",
         annotations(
             title = "Create fleet",
             read_only_hint = false,
@@ -867,23 +927,34 @@ impl Fleet {
         &self,
         Parameters(a): Parameters<CreateFleetArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let args = json!({ "fleet": a.fleet, "parent": a.parent, "tags": a.tags });
+        let args =
+            json!({ "title": a.title, "fleet": a.fleet, "parent": a.parent, "tags": a.tags });
         self.audited("create_fleet", args, async {
             self.may_place(a.parent.as_deref(), "creating a fleet")?;
             let known = self.state.db.fleets()?;
-            let existed = known.iter().any(|f| f.name == a.fleet);
-            self.state.db.create_fleet(&a.fleet)?;
+            let fleet = match (&a.fleet, &a.title) {
+                // An old fleet's name stays as it was.
+                (Some(f), _) if known.iter().any(|k| &k.name == f) => f.clone(),
+                (Some(f), _) => crate::db::slug(f)?,
+                (None, Some(t)) => crate::db::slug(t)?,
+                (None, None) => anyhow::bail!("give the fleet a `title`"),
+            };
+            let existed = known.iter().any(|f| f.name == fleet);
+            self.state.db.create_fleet(&fleet)?;
             if !existed {
+                if let Some(t) = &a.title {
+                    self.state.db.set_fleet_title(&fleet, t)?;
+                }
                 if a.parent.is_some() {
                     self.state
                         .db
-                        .set_fleet_parent(&a.fleet, a.parent.as_deref())?;
+                        .set_fleet_parent(&fleet, a.parent.as_deref())?;
                 }
                 if !a.tags.is_empty() {
-                    self.state.db.set_fleet_tags(&a.fleet, &a.tags)?;
+                    self.state.db.set_fleet_tags(&fleet, &a.tags)?;
                 }
             }
-            Ok(rendered(json!({ "fleet": a.fleet, "created": !existed })))
+            Ok(rendered(json!({ "fleet": fleet, "created": !existed })))
         })
         .await
     }
@@ -920,8 +991,11 @@ impl Fleet {
 
     #[tool(
         name = "update_fleet",
-        description = "Move a fleet in the tree or change its tags. Its devices re-apply what \
-                       they now inherit from where it sits.",
+        description = "Move a fleet in the tree, or change its title, tags or note. Its slug \
+                       never changes. Its devices \
+                       re-apply what they now inherit from where it sits. The note is free \
+                       text (Markdown) for people and for you: what the fleet is, where, who \
+                       to call.",
         annotations(
             title = "Update fleet",
             read_only_hint = false,
@@ -932,7 +1006,7 @@ impl Fleet {
         &self,
         Parameters(a): Parameters<UpdateFleetArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let args = json!({ "fleet": a.fleet, "parent": a.parent, "top_level": a.top_level, "tags": a.tags });
+        let args = json!({ "fleet": a.fleet, "parent": a.parent, "top_level": a.top_level, "tags": a.tags, "title": a.title, "note": a.note });
         self.audited("update_fleet", args, async {
             anyhow::ensure!(
                 !(a.top_level && a.parent.is_some()),
@@ -949,6 +1023,12 @@ impl Fleet {
             if let Some(tags) = &a.tags {
                 self.state.db.set_fleet_tags(&a.fleet, tags)?;
             }
+            if let Some(note) = &a.note {
+                self.state.db.set_fleet_note(&a.fleet, note)?;
+            }
+            if let Some(title) = &a.title {
+                self.state.db.set_fleet_title(&a.fleet, title)?;
+            }
             let devices = if moved {
                 self.push_scope("fleet", &a.fleet).await
             } else {
@@ -961,9 +1041,12 @@ impl Fleet {
 
     #[tool(
         name = "update_device",
-        description = "Replace a device's own tags, each `key` or `key=value` like \
-                       `type=rock-5b`. It also has its fleets' tags, as `inherited_tags` in \
-                       `list_devices`.",
+        description = "Change a device's title (what people call it; its slug never \
+                       changes), its note, or its own tags, each `key` or `key=value` like \
+                       `type=rock-5b`. It also has its fleets' tags, as \
+                       `inherited_tags` in `list_devices`. The note is free text (Markdown) \
+                       for people and for you: how it's wired, quirks, what fixed it last \
+                       time.",
         annotations(
             title = "Update device",
             read_only_hint = false,
@@ -974,11 +1057,25 @@ impl Fleet {
         &self,
         Parameters(a): Parameters<UpdateDeviceArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let args = json!({ "device": a.device, "tags": a.tags });
+        let args = json!({ "device": a.device, "tags": a.tags, "title": a.title, "note": a.note });
         self.audited("update_device", args, async {
-            let d = self.device_for(&a.device, Level::Operator, "changing its tags")?;
-            self.state.db.set_device_tags(&d.id, &a.tags)?;
-            Ok(rendered(json!({ "device": d.name, "tags": a.tags })))
+            anyhow::ensure!(
+                a.tags.is_some() || a.title.is_some() || a.note.is_some(),
+                "give `title`, `tags` or `note`"
+            );
+            let d = self.device_for(&a.device, Level::Operator, "changing it")?;
+            if let Some(tags) = &a.tags {
+                self.state.db.set_device_tags(&d.id, tags)?;
+            }
+            if let Some(note) = &a.note {
+                self.state.db.set_device_note(&d.id, note)?;
+            }
+            if let Some(title) = &a.title {
+                self.state.db.set_device_title(&d.id, title)?;
+            }
+            Ok(rendered(
+                json!({ "device": d.name, "title": a.title, "tags": a.tags, "note": a.note }),
+            ))
         })
         .await
     }
@@ -1460,9 +1557,11 @@ impl Fleet {
 
     #[tool(
         name = "set_variable",
-        description = "Set an app variable for a fleet or one device, and optionally one \
-                       service. Weakest first: the release's default, fleet, fleet and service, \
-                       device, device and service. Online devices re-apply at once, recreating \
+        description = "Set a variable for a fleet or one device: for one app, optionally one \
+                       of its services, or with no `app` for every app (like a site id every \
+                       app reads). A service only receives names its compose file declares. \
+                       Weakest first: the release's default, then for the outermost fleet in \
+                       to the device itself: every app, the app, the app's service. Online devices re-apply at once, recreating \
                        only services whose environment changed; offline ones get it when they \
                        reconnect. If the change fails the health gate the device goes back to \
                        the last values that passed. A value \
@@ -1687,6 +1786,50 @@ impl Fleet {
     }
 
     #[tool(
+        name = "list_connections",
+        description = "MCP clients people connected by signing in with GitHub: who, which \
+                       client, and since when. Reads only.",
+        annotations(
+            title = "List connections",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn list_connections(&self) -> Result<CallToolResult, ErrorData> {
+        self.audited("list_connections", json!({}), async {
+            Ok(rendered(
+                json!({ "connections": self.state.db.oauth_connections()? }),
+            ))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "revoke_connection",
+        description = "End an MCP client's connection at once, by the id `list_connections` \
+                       gives. It has to sign in again to come back.",
+        annotations(
+            title = "Revoke connection",
+            read_only_hint = false,
+            destructive_hint = true
+        )
+    )]
+    async fn revoke_connection(
+        &self,
+        Parameters(a): Parameters<ConnectionArg>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.audited("revoke_connection", json!({ "id": a.id }), async {
+            anyhow::ensure!(
+                self.state.db.oauth_delete_grant(a.id)?,
+                "no connection {}",
+                a.id
+            );
+            Ok(rendered(json!({ "revoked": a.id })))
+        })
+        .await
+    }
+
+    #[tool(
         name = "revoke_token",
         description = "Revoke an API token at once. Anyone signed in with it is signed out.",
         annotations(
@@ -1837,11 +1980,16 @@ impl Fleet {
         // Keys are public, but the list is noise in an audit trail; the count
         // says what changed.
         let args = json!({
-            "fleet": a.fleet, "device_type": a.device_type, "arch": a.arch, "hostname": a.hostname, "ssh_keys": a.ssh_keys.len(),
+            "fleet": a.fleet, "device_type": a.device_type, "arch": a.arch, "hostname": a.hostname, "title": a.title, "ssh_keys": a.ssh_keys.len(),
         });
         self.audited("create_provisioning_image", args, async {
             let this = self.clone();
-            let v = tokio::task::spawn_blocking(move || this.provision(&a)).await??;
+            // A blocking thread doesn't inherit the task's caller; carry it.
+            let caller = CALLER.try_with(Clone::clone)?;
+            let v = tokio::task::spawn_blocking(move || {
+                CALLER.sync_scope(caller, || this.provision(&a))
+            })
+            .await??;
             Ok(rendered(v))
         })
         .await
@@ -1942,7 +2090,7 @@ mod tests {
         db.set_fleet_parent("acme-east", Some("acme")).unwrap();
         db.set_fleet_parent("line-07", Some("acme-east")).unwrap();
         for (fleet, name) in [("line-07", "press"), ("other", "far")] {
-            let token = db.mint_token(fleet, Some(name), 60, None).unwrap();
+            let token = db.mint_token(fleet, Some(name), "", 60, None).unwrap();
             db.enroll(&Enrollment {
                 token,
                 hostname: name.into(),
@@ -2085,6 +2233,59 @@ mod tests {
             let e = r.refused(&t, tool, json!({})).await;
             assert!(e.contains("needs an admin"), "{tool}: {e}");
         }
+    }
+
+    #[tokio::test]
+    async fn notes_are_kept_and_read_back() {
+        let r = rig().await;
+        let t = r.token("op", Some(Level::Operator), Some("line-07"));
+        r.call(
+            &t,
+            "update_device",
+            json!({ "device": "press", "note": "  COM3 is the scale.\n" }),
+        )
+        .await
+        .unwrap();
+        let devices = r.call(&t, "list_devices", json!({})).await.unwrap();
+        let press = &devices["devices"][0];
+        assert_eq!(press["note"], "COM3 is the scale.");
+        // Changing the note leaves the tags, and the other way round.
+        r.call(
+            &t,
+            "update_device",
+            json!({ "device": "press", "tags": ["a"] }),
+        )
+        .await
+        .unwrap();
+        let devices = r.call(&t, "list_devices", json!({})).await.unwrap();
+        assert_eq!(devices["devices"][0]["note"], "COM3 is the scale.");
+        let e = r
+            .refused(
+                &t,
+                "update_fleet",
+                json!({ "fleet": "line-07", "note": "x" }),
+            )
+            .await;
+        assert!(e.contains("is an operator on"), "{e}");
+        let long = "x".repeat(crate::db::NOTE_MAX + 1);
+        let e = r
+            .refused(
+                &t,
+                "update_device",
+                json!({ "device": "press", "note": long }),
+            )
+            .await;
+        assert!(e.contains("at most"), "{e}");
+        let admin = r.token("boss", None, None);
+        r.call(
+            &admin,
+            "update_fleet",
+            json!({ "fleet": "line-07", "note": "Plant 2" }),
+        )
+        .await
+        .unwrap();
+        let fleets = r.call(&t, "list_fleets", json!({})).await.unwrap();
+        assert_eq!(fleets["fleets"][0]["note"], "Plant 2");
     }
 
     #[tokio::test]

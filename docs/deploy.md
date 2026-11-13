@@ -82,7 +82,7 @@ CI publishes that image from every commit on `main`, as `:latest` and
 `via-server:latest`.
 
 On Railway: run the image as a service, with a volume on `/data` and
-`VIA_PUBLIC_URL` and `VIA_ADMIN_TOKEN` set. To redeploy on every commit, give
+`VIA_PUBLIC_URL`, `VIA_ADMIN_TOKEN` and `VIA_TRUST_PROXY=2` set. To redeploy on every commit, give
 the repository a `RAILWAY_SERVICE` variable and a `RAILWAY_TOKEN` secret holding
 a project token.
 
@@ -113,25 +113,33 @@ CI or on the machine you release from.
 
 ## 4. Signing
 
-There is nothing to set up. `via` makes its keys in `~/.config/via` the first
-time it needs them, and signs everything it publishes: the server refuses an OS
-version that isn't signed, so every version can go on every device. Back up
-that directory, and give the server `signing.key.pub` as `VIA_TRUSTED_KEYS`.
+Off by default, as on balenaOS: images and releases are plain, devices get
+updates from your server over HTTPS, and only an admin can publish an OS. No
+key lives on whatever machine ran `via`.
 
-Secure Boot uses the same images. `via base-image` signs systemd-boot and the
-UKI and puts the keys on the boot partition. A device whose firmware is in
-setup mode (clear the keys in its firmware menu once) enrolls them on first
-boot, reboots, and from then on runs only what these keys signed. The UKI holds
-the kernel, initrd, command line and the root hash of the dm-verity /nix/store,
-so that is the whole OS. A device left out of setup mode with Secure Boot off
-just boots them. Losing the keys means re-imaging devices that enrolled them.
+To turn it on later:
 
-The keys replace the firmware's own, Microsoft's included. Hardware whose
-graphics or network card loads a Microsoft-signed option ROM at boot will
-not show a picture or PXE boot with only these keys. Keep the `.key` files
-off the server.
+- **Release signing.** `via keygen <path>` makes a key. Sign with
+  `--sign-key <path>` (or `VIA_SIGNING_KEY`), and give the server the `.pub`
+  as `VIA_TRUSTED_KEYS`: it then refuses anything that key didn't sign.
+- **Secure Boot.** `via secure-boot keygen <dir>` makes keys; pass
+  `--secure-boot <dir>` (or `VIA_SECURE_BOOT_KEYS`) to `via base-image` and
+  `via os-release`. A device whose firmware is in setup mode enrolls them on
+  first boot and from then on runs only what they signed, so losing them means
+  re-imaging those devices. The keys replace the firmware's own, Microsoft's
+  included: hardware whose graphics or network card loads a Microsoft-signed
+  option ROM won't show a picture or PXE boot.
+
+Keep keys with your release secrets, never on the server.
 
 ## 5. Give it an OS
+
+Nothing to do: each `v<N>` release on GitHub carries plain base images
+(`viaos-<arch>.raw.zst`), and a server with no base image for an architecture
+fetches the latest one at startup, then checks hourly. `VIA_IMAGE_SOURCE`
+points it elsewhere (`<source>/viaos-<arch>.raw.zst`), or `none` turns it off.
+
+To use your own build instead:
 
 ```bash
 export VIA_SERVER=https://via.example.com VIA_TOKEN=<token>
@@ -139,9 +147,12 @@ nix build .#images.x86_64 -o image && via base-image image/viaos_1.raw --arch x8
 nix build .#images.aarch64 -o image-arm && via base-image image-arm/viaos_1.raw --arch aarch64
 ```
 
-For each new OS version, bump `VERSION`, then run
-`nix build .#updates.x86_64 -o update` and `via os-release update`.
-`.github/workflows/release.yml` does both architectures on a `v<N>` tag.
+For each new OS version, bump `VERSION` and push a `v<N>` tag:
+`.github/workflows/release.yml` builds both architectures and attaches the base
+images and OS updates (`viaos-update-<arch>.tar`) to the release. With the
+`VIA_SERVER` and `VIA_TOKEN` repository secrets it also publishes them to that
+control plane. By hand: `nix build .#updates.x86_64 -o update` and
+`via os-release update`.
 
 ## 6. Point Claude at it
 
@@ -166,13 +177,17 @@ services:
 
 Set values on the console's Variables page (or with `set_variable`), for a
 whole fleet or one device, and for every service that declares the name or just
-one of them. The strongest value wins, weakest first:
+one of them. A value can also be for every app (leave out `app`), like a site id
+that each app reads: it reaches any service, in any app, that declares the name.
+The strongest value wins, weakest first:
 
 1. the release's default (below)
-2. fleet
-3. fleet, for one service
-4. device
-5. device, for one service
+2. fleet, for every app
+3. fleet
+4. fleet, for one service
+5. device, for every app
+6. device
+7. device, for one service
 
 A device's value always beats a fleet's, even one aimed at a service. A service
 never receives a name it did not declare, however the value was aimed.
@@ -255,9 +270,10 @@ A grant names a GitHub user (`github:<login>`), a GitHub team
 (`github-team:<slug>`), everyone in the GitHub organisation (`github-org`), or an
 API token (`token:<name>`); someone gets the strongest role any of those gives
 them. Fleets and devices outside your grants don't exist for you: they aren't
-listed, and naming one gets "no fleet named". A new server, or one upgraded from
-before roles, grants `github-org` observer on every fleet, which is what members
-could do before; remove that grant to let in only the people and teams you name.
+listed, and naming one gets "no fleet named". A new server has no grants, so only
+admins can do anything until you give out roles. A server upgraded from before
+roles grants `github-org` observer on every fleet, which is what members could do
+before; remove that grant to let in only the people and teams you name.
 
 Still an admin's alone: tokens, grants, the audit log, device types, OS updates
 and base images, and fleets at the top level. Uploading an app release needs
@@ -292,6 +308,32 @@ at sign-in, members of child teams included, so a new team grant reaches someone
 when they next sign in; grants to a user or the organisation apply at once. A
 session lasts 12 hours, so someone removed from the organisation or a team loses
 access within that time. For GitHub Enterprise Server, set `VIA_GITHUB_URL`.
+
+Requests from people not signed in (signing in, OAuth, enrolling, and tokens
+the server doesn't know) are limited to 30 a minute from each address, with a
+burst of 30; a refused enrollment counts, a good one doesn't. Behind proxies,
+set `VIA_TRUST_PROXY` to how many add to X-Forwarded-For (1 for one nginx, 2 on
+Railway) so the limit applies to the client rather than to the proxy. Signed-in requests aren't
+limited.
+
+
+### Connecting Claude with GitHub
+
+With GitHub sign-in on, an MCP client needs no token:
+
+```bash
+claude mcp add --transport http via https://via.example.com/mcp
+```
+
+Then `/mcp` in Claude Code to sign in. In claude.ai, add
+`https://via.example.com/mcp` as a custom connector. Either way you sign in with
+GitHub in a browser and approve the client on a page that says where its access
+is going. It gets your roles, and works on `/mcp` alone.
+
+Access tokens last an hour, and each refresh asks GitHub again, so someone
+removed from the organisation is out within the hour. GitHub's token for each
+connection is kept sealed with the server's secret key. An admin can see every
+connection on the Access page and revoke one at once.
 
 ### Hardware
 

@@ -156,9 +156,9 @@ pub fn keygen(path: &Path) -> Result<Value> {
     }))
 }
 
-/// Sign an OS update (the output of `nix build .#updates.<arch>`) and upload
-/// it. The manifest goes last: it is what publishes the version.
-pub fn os_release(remote: &Remote, dir: &Path, key: &Path) -> Result<Value> {
+/// Upload an OS update (the output of `nix build .#updates.<arch>`), signed
+/// if there's a key. The manifest goes last: it is what publishes the version.
+pub fn os_release(remote: &Remote, dir: &Path, key: Option<&Path>) -> Result<Value> {
     let manifest_path = dir.join("manifest.json");
     let manifest_bytes = std::fs::read(&manifest_path)
         .with_context(|| format!("reading {}", manifest_path.display()))?;
@@ -177,15 +177,18 @@ pub fn os_release(remote: &Remote, dir: &Path, key: &Path) -> Result<Value> {
         eprintln!("uploading {name}");
         remote.put_file(&format!("{base}/{name}"), &dir.join(name))?;
     }
-    let signer =
-        SigningKey::read_from(key).with_context(|| format!("reading {}", key.display()))?;
-    let sig = serde_json::to_vec(&signer.sign_manifest(&manifest_bytes))?;
-    let tmp = std::env::temp_dir().join(format!("via-os-sig-{}", std::process::id()));
-    std::fs::write(&tmp, sig)?;
-    let r = remote.put_file(&format!("{base}/manifest.json.sig"), &tmp);
-    let _ = std::fs::remove_file(&tmp);
-    r?;
-    let signed = signer.key_id().to_string();
+    let mut signed = None;
+    if let Some(key) = key {
+        let signer =
+            SigningKey::read_from(key).with_context(|| format!("reading {}", key.display()))?;
+        let sig = serde_json::to_vec(&signer.sign_manifest(&manifest_bytes))?;
+        let tmp = std::env::temp_dir().join(format!("via-os-sig-{}", std::process::id()));
+        std::fs::write(&tmp, sig)?;
+        let r = remote.put_file(&format!("{base}/manifest.json.sig"), &tmp);
+        let _ = std::fs::remove_file(&tmp);
+        r?;
+        signed = Some(signer.key_id().to_string());
+    }
     remote.put_file(&format!("{base}/manifest.json"), &manifest_path)?;
     Ok(json!({
         "arch": arch,
@@ -196,8 +199,14 @@ pub fn os_release(remote: &Remote, dir: &Path, key: &Path) -> Result<Value> {
 }
 
 /// Upload a raw viaos image as the base that provisioning images are made
-/// from, compressed on the way. A copy of it is signed for Secure Boot first.
-pub fn base_image(remote: &Remote, raw: &Path, arch: &str, secure_boot: &Path) -> Result<Value> {
+/// from, compressed on the way. With Secure Boot keys, a copy of it is
+/// signed for Secure Boot first.
+pub fn base_image(
+    remote: &Remote,
+    raw: &Path,
+    arch: &str,
+    secure_boot: Option<&Path>,
+) -> Result<Value> {
     let tmp = std::env::temp_dir().join(format!("via-base-{}.raw.zst", std::process::id()));
     let signed = std::env::temp_dir().join(format!("via-base-{}.raw", std::process::id()));
     let result = (|| {
@@ -207,7 +216,9 @@ pub fn base_image(remote: &Remote, raw: &Path, arch: &str, secure_boot: &Path) -
             .arg(&signed)
             .status()?;
         anyhow::ensure!(status.success(), "copying {} failed", raw.display());
-        crate::secureboot::sign_image(secure_boot, &signed)?;
+        if let Some(keys) = secure_boot {
+            crate::secureboot::sign_image(keys, &signed)?;
+        }
         let mut src = std::fs::File::open(&signed)
             .with_context(|| format!("opening {}", signed.display()))?;
         let mut enc = zstd::Encoder::new(std::fs::File::create(&tmp)?, 3)?;

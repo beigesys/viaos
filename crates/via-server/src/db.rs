@@ -100,6 +100,43 @@ CREATE TABLE IF NOT EXISTS sessions (
     role        TEXT NOT NULL,
     expires_at  INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS oauth_clients (
+    id            TEXT PRIMARY KEY,
+    name          TEXT,
+    redirect_uris TEXT NOT NULL,
+    created_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS oauth_requests (
+    id_hash       TEXT PRIMARY KEY,
+    client_id     TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
+    redirect_uri  TEXT NOT NULL,
+    state         TEXT,
+    challenge     TEXT NOT NULL,
+    expires_at    INTEGER NOT NULL,
+    caller        TEXT,
+    github_token  BLOB,
+    consent_hash  TEXT UNIQUE,
+    code_hash     TEXT UNIQUE
+);
+CREATE TABLE IF NOT EXISTS oauth_grants (
+    id            INTEGER PRIMARY KEY,
+    client_id     TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
+    caller        TEXT NOT NULL,
+    github_token  BLOB NOT NULL,
+    refresh_hash  TEXT NOT NULL UNIQUE,
+    created_at    INTEGER NOT NULL,
+    expires_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS oauth_retired (
+    token_hash    TEXT PRIMARY KEY,
+    grant_id      INTEGER NOT NULL REFERENCES oauth_grants(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS oauth_access (
+    token_hash    TEXT PRIMARY KEY,
+    grant_id      INTEGER NOT NULL REFERENCES oauth_grants(id) ON DELETE CASCADE,
+    caller        TEXT NOT NULL,
+    expires_at    INTEGER NOT NULL
+);
 ";
 
 /// Grants: a role (see access::Level, stored as its rank) for a subject on a
@@ -147,8 +184,58 @@ impl Role {
     }
 }
 
+/// How many idle clients, and how many requests nobody has signed in to,
+/// are kept. Registering and starting a sign-in are open to anyone.
+const OAUTH_MAX_ROWS: i64 = 10_000;
+
+/// A client that registered with [`crate::oauth`].
+pub struct OAuthClient {
+    pub redirect_uris: Vec<String>,
+}
+
+/// A connection waiting for its consent page to be answered.
+pub struct OAuthPending {
+    pub client_name: Option<String>,
+    pub redirect_uri: String,
+    pub state: Option<String>,
+    pub caller: Caller,
+}
+
+/// A connection, as an admin sees it.
+#[derive(Debug, Serialize)]
+pub struct OAuthConnection {
+    pub id: i64,
+    pub who: String,
+    pub client: Option<String>,
+    pub connected_at: i64,
+    pub expires_at: i64,
+}
+
+/// A code, spent.
+pub struct OAuthCode {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub challenge: String,
+    pub caller: Caller,
+    pub github_token: Vec<u8>,
+}
+
+pub struct OAuthGrant {
+    pub id: i64,
+    pub client_id: String,
+    pub github_token: Vec<u8>,
+}
+
+/// What a refresh token turned out to be.
+pub enum OAuthRefresh {
+    Live(OAuthGrant),
+    /// Already spent, on the connection with this id.
+    Reused(i64),
+    Unknown,
+}
+
 /// Whoever an API request authenticated as.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct Caller {
     pub name: String,
     pub role: Role,
@@ -207,18 +294,26 @@ pub struct Db {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Fleet {
+    /// Its slug: how tools and URLs name it. Never changes.
     pub name: String,
+    /// What people call it, e.g. `Line 7, Plant 2`. Empty: use the slug.
+    pub title: String,
     /// The fleet this one sits under, if any.
     pub parent: Option<String>,
     pub tags: Vec<String>,
     /// Devices directly in this fleet, not those in fleets under it.
     pub devices: u64,
+    /// What people should know about it, in their own words.
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Device {
     pub id: String,
+    /// Its slug, from its hostname.
     pub name: String,
+    /// What people call it, e.g. `Packing scale`. Empty: use the slug.
+    pub title: String,
     pub fleet: String,
     pub arch: Option<String>,
     pub os_version: Option<String>,
@@ -227,6 +322,8 @@ pub struct Device {
     pub last_seen: Option<i64>,
     /// Its own. See [`check_tag`].
     pub tags: Vec<String>,
+    /// What people should know about it, in their own words.
+    pub note: String,
 }
 
 /// What a device reports about itself when it enrolls.
@@ -259,6 +356,9 @@ impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        let upgrading = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fleets'")?
+            .exists([])?;
         conn.execute_batch(SCHEMA)?;
         let nested = conn
             .prepare("SELECT 1 FROM pragma_table_info('fleets') WHERE name = 'parent_id'")?
@@ -267,6 +367,22 @@ impl Db {
             conn.execute_batch(
                 "ALTER TABLE fleets ADD COLUMN parent_id INTEGER REFERENCES fleets(id)",
             )?;
+        }
+        for (table, column) in [
+            ("fleets", "title"),
+            ("fleets", "note"),
+            ("devices", "title"),
+            ("devices", "note"),
+            ("enrollment_tokens", "title"),
+        ] {
+            let has = conn
+                .prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?
+                .exists([table, column])?;
+            if !has {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                ))?;
+            }
         }
         // What a new server can image from the OS builds in this repository.
         // The arm64 image carries both Pi firmware and a UEFI loader.
@@ -316,13 +432,21 @@ impl Db {
             )?;
         }
         conn.execute_batch(VARIABLES_IDENTITY)?;
+        lowercase_fleets(&conn)?;
         let has_grants = conn
             .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'grants'")?
             .exists([])?;
         if !has_grants {
-            // Everyone who could look still can: viewer tokens, and every
-            // member of the GitHub organisation. Their sessions end, since
-            // they say nothing of who they answer to.
+            // On a server that was running, everyone who could look still
+            // can: viewer tokens, and every member of the GitHub organisation.
+            // Their sessions end, since they say nothing of who they answer
+            // to. A new server starts with nobody but admins.
+            let org = if upgrading {
+                "INSERT INTO grants (subject, fleet_id, level, created_at)
+                     VALUES ('github-org', NULL, 1, unixepoch());"
+            } else {
+                ""
+            };
             conn.execute_batch(&format!(
                 "BEGIN;
                  {GRANTS}
@@ -330,8 +454,7 @@ impl Db {
                      SELECT 'token:' || name, NULL, 1, unixepoch() FROM api_tokens
                      WHERE role = 'viewer';
                  UPDATE api_tokens SET role = 'member' WHERE role = 'viewer';
-                 INSERT INTO grants (subject, fleet_id, level, created_at)
-                     VALUES ('github-org', NULL, 1, unixepoch());
+                 {org}
                  DELETE FROM sessions WHERE role != 'admin';
                  ALTER TABLE sessions ADD COLUMN subjects TEXT NOT NULL DEFAULT '';
                  COMMIT;"
@@ -357,7 +480,8 @@ impl Db {
         let mut q = c.prepare(
             "SELECT f.name, p.name, COUNT(d.id),
                     (SELECT group_concat(tag, char(10)) FROM
-                       (SELECT tag FROM fleet_tags WHERE fleet_id = f.id ORDER BY tag))
+                       (SELECT tag FROM fleet_tags WHERE fleet_id = f.id ORDER BY tag)),
+                    f.note, f.title
              FROM fleets f
              LEFT JOIN fleets p ON p.id = f.parent_id
              LEFT JOIN devices d ON d.fleet_id = f.id GROUP BY f.id ORDER BY f.name",
@@ -371,6 +495,8 @@ impl Db {
                 tags: tags
                     .map(|t| t.split('\n').map(String::from).collect())
                     .unwrap_or_default(),
+                note: r.get(4)?,
+                title: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -528,6 +654,48 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_device_note(&self, id: &str, note: &str) -> Result<()> {
+        let note = check_note(note)?;
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE devices SET note = ?2 WHERE id = ?1",
+            params![id, note],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_device_title(&self, id: &str, title: &str) -> Result<()> {
+        let title = check_title(title)?;
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE devices SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_fleet_title(&self, name: &str, title: &str) -> Result<()> {
+        let title = check_title(title)?;
+        let c = self.conn.lock().unwrap();
+        let id = fleet_id(&c, name)?;
+        c.execute(
+            "UPDATE fleets SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_fleet_note(&self, name: &str, note: &str) -> Result<()> {
+        let note = check_note(note)?;
+        let c = self.conn.lock().unwrap();
+        let id = fleet_id(&c, name)?;
+        c.execute(
+            "UPDATE fleets SET note = ?2 WHERE id = ?1",
+            params![id, note],
+        )?;
+        Ok(())
+    }
+
     pub fn set_fleet_tags(&self, name: &str, tags: &[String]) -> Result<()> {
         for t in tags {
             check_tag(t)?;
@@ -552,16 +720,18 @@ impl Db {
         &self,
         fleet: &str,
         hostname: Option<&str>,
+        title: &str,
         ttl_secs: i64,
         image_id: Option<&str>,
     ) -> Result<String> {
+        let title = check_title(title)?;
         let c = self.conn.lock().unwrap();
         let fleet_id = fleet_id(&c, fleet)?;
         let token = random_secret();
         c.execute(
-            "INSERT INTO enrollment_tokens (token_hash, fleet_id, hostname, created_at, expires_at, image_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![hash(&token), fleet_id, hostname, now(), now() + ttl_secs, image_id],
+            "INSERT INTO enrollment_tokens (token_hash, fleet_id, hostname, title, created_at, expires_at, image_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![hash(&token), fleet_id, hostname, title, now(), now() + ttl_secs, image_id],
         )?;
         Ok(token)
     }
@@ -576,15 +746,32 @@ impl Db {
     pub fn enroll(&self, e: &Enrollment) -> Result<(Device, String, Option<String>)> {
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
-        let row: Option<(i64, Option<String>, i64, Option<String>, Option<String>)> = tx
+        let row: Option<Spent> = tx
             .query_row(
-                "SELECT fleet_id, hostname, expires_at, used_by, image_id FROM enrollment_tokens
-                 WHERE token_hash = ?1",
+                "SELECT fleet_id, hostname, expires_at, used_by, image_id, title
+                 FROM enrollment_tokens WHERE token_hash = ?1",
                 [hash(&e.token)],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| {
+                    Ok(Spent {
+                        fleet_id: r.get(0)?,
+                        hostname: r.get(1)?,
+                        expires_at: r.get(2)?,
+                        used_by: r.get(3)?,
+                        image_id: r.get(4)?,
+                        title: r.get(5)?,
+                    })
+                },
             )
             .optional()?;
-        let Some((fleet_id, name, expires_at, used_by, image_id)) = row else {
+        let Some(Spent {
+            fleet_id,
+            hostname,
+            expires_at,
+            used_by,
+            image_id,
+            title,
+        }) = row
+        else {
             bail!("unknown token")
         };
         if used_by.is_some() {
@@ -594,12 +781,26 @@ impl Db {
             bail!("token expired");
         }
         let id = random_secret()[..16].to_string();
-        let name = name.unwrap_or_else(|| e.hostname.clone());
+        // A device's slug is its hostname, lowercase, and no other device's:
+        // two boxes both left as `viaos` become `viaos` and `viaos-2`.
+        let base = slug(&hostname.unwrap_or_else(|| e.hostname.clone()))
+            .unwrap_or_else(|_| "device".into());
+        let taken = |n: &str| -> rusqlite::Result<bool> {
+            tx.prepare("SELECT 1 FROM devices WHERE lower(name) = ?1")?
+                .exists([n])
+        };
+        let mut name = base.clone();
+        let mut n = 2;
+        while taken(&name)? {
+            let suffix = format!("-{n}");
+            name = format!("{}{suffix}", &base[..base.len().min(63 - suffix.len())]);
+            n += 1;
+        }
         let credential = random_secret();
         tx.execute(
-            "INSERT INTO devices (id, name, fleet_id, credential_hash, arch, os_version,
+            "INSERT INTO devices (id, name, title, fleet_id, credential_hash, arch, os_version,
                                   agent_version, enrolled_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             VALUES (?1, ?2, ?9, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 id,
                 name,
@@ -608,7 +809,8 @@ impl Db {
                 e.arch,
                 e.os_version,
                 e.agent_version,
-                now()
+                now(),
+                title
             ],
         )?;
         tx.execute(
@@ -878,6 +1080,339 @@ impl Db {
         Ok(())
     }
 
+    /// Remove what has expired. Anyone can add to these tables, so it also
+    /// keeps them bounded: past [`OAUTH_MAX_ROWS`] the oldest idle rows go.
+    fn oauth_tidy(c: &Connection) -> Result<()> {
+        let t = now();
+        c.execute("DELETE FROM oauth_requests WHERE expires_at <= ?1", [t])?;
+        c.execute("DELETE FROM oauth_grants WHERE expires_at <= ?1", [t])?;
+        c.execute("DELETE FROM oauth_access WHERE expires_at <= ?1", [t])?;
+        c.execute(
+            "DELETE FROM oauth_requests WHERE caller IS NULL AND id_hash IN (
+                 SELECT id_hash FROM oauth_requests WHERE caller IS NULL
+                 ORDER BY expires_at DESC LIMIT -1 OFFSET ?1)",
+            [OAUTH_MAX_ROWS],
+        )?;
+        const IDLE: &str = "id NOT IN (SELECT client_id FROM oauth_grants)
+             AND id NOT IN (SELECT client_id FROM oauth_requests WHERE caller IS NOT NULL)";
+        c.execute(
+            &format!("DELETE FROM oauth_clients WHERE created_at <= ?1 AND {IDLE}"),
+            [t - 86400],
+        )?;
+        c.execute(
+            &format!(
+                "DELETE FROM oauth_clients WHERE {IDLE} AND id IN (
+                     SELECT id FROM oauth_clients WHERE {IDLE}
+                     ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?1)"
+            ),
+            [OAUTH_MAX_ROWS],
+        )?;
+        Ok(())
+    }
+
+    pub fn oauth_sweep(&self) -> Result<()> {
+        Self::oauth_tidy(&self.conn.lock().unwrap())
+    }
+
+    /// Register a client.
+    pub fn oauth_add_client(&self, name: Option<&str>, uris: &[String]) -> Result<String> {
+        let c = self.conn.lock().unwrap();
+        let id = random_secret();
+        c.execute(
+            "INSERT INTO oauth_clients (id, name, redirect_uris, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, name, serde_json::to_string(uris)?, now()],
+        )?;
+        Self::oauth_tidy(&c)?;
+        Ok(id)
+    }
+
+    pub fn oauth_client(&self, id: &str) -> Result<Option<OAuthClient>> {
+        let c = self.conn.lock().unwrap();
+        let uris: Option<String> = c
+            .query_row(
+                "SELECT redirect_uris FROM oauth_clients WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        uris.map(|u| {
+            Ok(OAuthClient {
+                redirect_uris: serde_json::from_str(&u)?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Note what a client asked for. The id is the GitHub sign-in's state.
+    pub fn oauth_begin(
+        &self,
+        client_id: &str,
+        redirect_uri: &str,
+        state: Option<&str>,
+        challenge: &str,
+        ttl_secs: i64,
+    ) -> Result<String> {
+        let id = random_secret();
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO oauth_requests (id_hash, client_id, redirect_uri, state, challenge, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![hash(&id), client_id, redirect_uri, state, challenge, now() + ttl_secs],
+        )?;
+        Self::oauth_tidy(&c)?;
+        Ok(id)
+    }
+
+    /// GitHub has said who is signing in. Returns the id only their browser
+    /// gets, which is a new one: whoever started the request knows the other.
+    /// None if `id` is no client's request, as for a sign-in to the console.
+    pub fn oauth_identified(
+        &self,
+        id: &str,
+        caller: &Caller,
+        github_token: &[u8],
+    ) -> Result<Option<String>> {
+        let consent = random_secret();
+        let n = self.conn.lock().unwrap().execute(
+            "UPDATE oauth_requests SET caller = ?2, github_token = ?3, consent_hash = ?4
+             WHERE id_hash = ?1 AND expires_at > ?5 AND caller IS NULL",
+            params![
+                hash(id),
+                serde_json::to_string(caller)?,
+                github_token,
+                hash(&consent),
+                now()
+            ],
+        )?;
+        Ok((n == 1).then_some(consent))
+    }
+
+    pub fn oauth_pending(&self, consent: &str) -> Result<Option<OAuthPending>> {
+        let c = self.conn.lock().unwrap();
+        let row: Option<(Option<String>, String, Option<String>, String)> = c
+            .query_row(
+                "SELECT cl.name, r.redirect_uri, r.state, r.caller
+                 FROM oauth_requests r JOIN oauth_clients cl ON cl.id = r.client_id
+                 WHERE r.consent_hash = ?1 AND r.expires_at > ?2 AND r.code_hash IS NULL",
+                params![hash(consent), now()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        row.map(|(client_name, redirect_uri, state, caller)| {
+            Ok(OAuthPending {
+                client_name,
+                redirect_uri,
+                state,
+                caller: serde_json::from_str(&caller)?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Someone said yes: make the code the client will trade for tokens.
+    pub fn oauth_approve(&self, consent: &str, ttl_secs: i64) -> Result<String> {
+        let code = random_secret();
+        let n = self.conn.lock().unwrap().execute(
+            "UPDATE oauth_requests SET code_hash = ?2, expires_at = ?3
+             WHERE consent_hash = ?1 AND code_hash IS NULL",
+            params![hash(consent), hash(&code), now() + ttl_secs],
+        )?;
+        anyhow::ensure!(n == 1, "that request is gone");
+        Ok(code)
+    }
+
+    pub fn oauth_forget(&self, consent: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM oauth_requests WHERE consent_hash = ?1",
+            [hash(consent)],
+        )?;
+        Ok(())
+    }
+
+    /// Spend a code. Whatever comes of it, it can't be tried again.
+    pub fn oauth_take_code(&self, code: &str) -> Result<Option<OAuthCode>> {
+        let c = self.conn.lock().unwrap();
+        let row: Option<(String, String, String, String, Vec<u8>)> = c
+            .query_row(
+                "DELETE FROM oauth_requests WHERE code_hash = ?1 AND expires_at > ?2
+                 RETURNING client_id, redirect_uri, challenge, caller, github_token",
+                params![hash(code), now()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        row.map(
+            |(client_id, redirect_uri, challenge, caller, github_token)| {
+                Ok(OAuthCode {
+                    client_id,
+                    redirect_uri,
+                    challenge,
+                    caller: serde_json::from_str(&caller)?,
+                    github_token,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    fn oauth_access(c: &Connection, grant: i64, caller: &str, ttl_secs: i64) -> Result<String> {
+        let access = format!("{}{}", crate::oauth::ACCESS_PREFIX, random_secret());
+        c.execute(
+            "INSERT INTO oauth_access (token_hash, grant_id, caller, expires_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![hash(&access), grant, caller, now() + ttl_secs],
+        )?;
+        Ok(access)
+    }
+
+    /// Open a connection. Returns its access and refresh tokens.
+    pub fn oauth_grant(
+        &self,
+        client_id: &str,
+        caller: &Caller,
+        github_token: &[u8],
+        access_secs: i64,
+        refresh_secs: i64,
+    ) -> Result<(String, String)> {
+        let c = self.conn.lock().unwrap();
+        let refresh = random_secret();
+        let caller = serde_json::to_string(caller)?;
+        c.execute(
+            "INSERT INTO oauth_grants
+                 (client_id, caller, github_token, refresh_hash, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                client_id,
+                caller,
+                github_token,
+                hash(&refresh),
+                now(),
+                now() + refresh_secs
+            ],
+        )?;
+        let access = Self::oauth_access(&c, c.last_insert_rowid(), &caller, access_secs)?;
+        Ok((access, refresh))
+    }
+
+    pub fn oauth_find_refresh(&self, token: &str) -> Result<OAuthRefresh> {
+        let c = self.conn.lock().unwrap();
+        let h = hash(token);
+        let live = c
+            .query_row(
+                "SELECT id, client_id, github_token FROM oauth_grants
+                 WHERE refresh_hash = ?1 AND expires_at > ?2",
+                params![h, now()],
+                |r| {
+                    Ok(OAuthGrant {
+                        id: r.get(0)?,
+                        client_id: r.get(1)?,
+                        github_token: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(g) = live {
+            return Ok(OAuthRefresh::Live(g));
+        }
+        let reused: Option<i64> = c
+            .query_row(
+                "SELECT grant_id FROM oauth_retired WHERE token_hash = ?1",
+                [h],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(reused.map_or(OAuthRefresh::Unknown, OAuthRefresh::Reused))
+    }
+
+    /// Spend a refresh token for a new pair, with what GitHub just said.
+    /// None if it was spent first by someone else.
+    pub fn oauth_rotate(
+        &self,
+        grant: i64,
+        old: &str,
+        caller: &Caller,
+        access_secs: i64,
+        refresh_secs: i64,
+    ) -> Result<Option<(String, String)>> {
+        let c = self.conn.lock().unwrap();
+        let refresh = random_secret();
+        let caller = serde_json::to_string(caller)?;
+        let n = c.execute(
+            "UPDATE oauth_grants
+             SET refresh_hash = ?1, caller = ?2, expires_at = ?3
+             WHERE id = ?4 AND refresh_hash = ?5",
+            params![
+                hash(&refresh),
+                caller,
+                now() + refresh_secs,
+                grant,
+                hash(old)
+            ],
+        )?;
+        if n != 1 {
+            return Ok(None);
+        }
+        c.execute(
+            "INSERT OR IGNORE INTO oauth_retired (token_hash, grant_id) VALUES (?1, ?2)",
+            params![hash(old), grant],
+        )?;
+        let access = Self::oauth_access(&c, grant, &caller, access_secs)?;
+        Ok(Some((access, refresh)))
+    }
+
+    /// End a connection, and its access tokens with it. False if it's gone.
+    pub fn oauth_delete_grant(&self, id: i64) -> Result<bool> {
+        let n = self
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM oauth_grants WHERE id = ?1", [id])?;
+        Ok(n == 1)
+    }
+
+    pub fn oauth_connections(&self) -> Result<Vec<OAuthConnection>> {
+        let c = self.conn.lock().unwrap();
+        let mut q = c.prepare(
+            "SELECT g.id, g.caller, cl.name, g.created_at, g.expires_at
+             FROM oauth_grants g JOIN oauth_clients cl ON cl.id = g.client_id
+             WHERE g.expires_at > ?1 ORDER BY g.created_at DESC",
+        )?;
+        let rows = q.query_map([now()], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, caller, client, connected_at, expires_at) = row?;
+            let who = serde_json::from_str::<Caller>(&caller)?.name;
+            Ok(OAuthConnection {
+                id,
+                who,
+                client,
+                connected_at,
+                expires_at,
+            })
+        })
+        .collect()
+    }
+
+    /// Who an access token belongs to, while it lasts.
+    pub fn oauth_caller(&self, token: &str) -> Result<Option<Caller>> {
+        let c = self.conn.lock().unwrap();
+        let row: Option<String> = c
+            .query_row(
+                "SELECT caller FROM oauth_access WHERE token_hash = ?1 AND expires_at > ?2",
+                params![hash(token), now()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row.and_then(|c| serde_json::from_str(&c).ok()))
+    }
+
     /// Who an API token belongs to, if anyone.
     pub fn api_caller(&self, token: &str) -> Result<Option<Caller>> {
         let c = self.conn.lock().unwrap();
@@ -1006,7 +1541,8 @@ impl Db {
 const DEVICE_SELECT: &str = "
     SELECT d.id, d.name, f.name, d.arch, d.os_version, d.agent_version, d.enrolled_at, d.last_seen,
            (SELECT group_concat(tag, char(10)) FROM
-              (SELECT tag FROM device_tags WHERE device_id = d.id ORDER BY tag))
+              (SELECT tag FROM device_tags WHERE device_id = d.id ORDER BY tag)),
+           d.note, d.title
     FROM devices d JOIN fleets f ON f.id = d.fleet_id";
 
 /// A tag is `key` or `key=value`, on a fleet or a device. The key is a plain
@@ -1031,6 +1567,106 @@ fn check_tag(tag: &str) -> Result<()> {
     Ok(())
 }
 
+/// Slugs are lowercase; a fleet named before they were gets its slug now,
+/// and keeps the old name as its title. Grants, tags and devices hold the
+/// fleet's id, so only variables, which name it, move with it. One whose
+/// slug is already taken keeps its name.
+fn lowercase_fleets(conn: &Connection) -> Result<()> {
+    let fleets: Vec<(i64, String, String)> = conn
+        .prepare("SELECT id, name, title FROM fleets")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, name, title) in fleets {
+        let Ok(new) = slug(&name) else { continue };
+        if new == name || fleets_named(conn, &new)? {
+            continue;
+        }
+        conn.execute_batch("BEGIN")?;
+        let moved = (|| -> Result<()> {
+            conn.execute(
+                "UPDATE fleets SET name = ?2, title = ?3 WHERE id = ?1",
+                params![id, new, if title.is_empty() { &name } else { &title }],
+            )?;
+            conn.execute(
+                "UPDATE variables SET target = ?2 WHERE scope = 'fleet' AND target = ?1",
+                params![name, new],
+            )?;
+            Ok(())
+        })();
+        match moved {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                tracing::info!(from = %name, to = %new, "fleet slug made lowercase");
+            }
+            Err(e) => {
+                conn.execute_batch("ROLLBACK")?;
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn fleets_named(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn
+        .prepare("SELECT 1 FROM fleets WHERE name = ?1")?
+        .exists([name])?)
+}
+
+/// An enrollment token as it's spent.
+struct Spent {
+    fleet_id: i64,
+    hostname: Option<String>,
+    expires_at: i64,
+    used_by: Option<String>,
+    image_id: Option<String>,
+    title: String,
+}
+
+/// A slug from what someone typed: lowercase letters, digits and single
+/// dashes, at most 63, so it also works as a hostname. `Line 7 (Plant 2)`
+/// is `line-7-plant-2`.
+pub fn slug(from: &str) -> Result<String> {
+    let mut out = String::new();
+    for c in from.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.truncate(63);
+    let out = out.trim_end_matches('-').to_string();
+    anyhow::ensure!(
+        !out.is_empty(),
+        "{from:?} has no letters or digits to make a name from"
+    );
+    Ok(out)
+}
+
+/// A title is one line of anything, up to 100 characters.
+fn check_title(title: &str) -> Result<&str> {
+    let title = title.trim();
+    anyhow::ensure!(
+        title.chars().count() <= 100 && !title.chars().any(char::is_control),
+        "a title is one line of at most 100 characters"
+    );
+    Ok(title)
+}
+
+/// Notes are free text: Markdown is fine, a whole manual isn't.
+pub const NOTE_MAX: usize = 10_000;
+
+fn check_note(note: &str) -> Result<&str> {
+    let note = note.trim();
+    anyhow::ensure!(
+        note.len() <= NOTE_MAX,
+        "a note is at most {NOTE_MAX} bytes; this one is {}",
+        note.len()
+    );
+    Ok(note)
+}
+
 fn device_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
     Ok(Device {
         id: r.get(0)?,
@@ -1045,6 +1681,8 @@ fn device_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
             .get::<_, Option<String>>(8)?
             .map(|t| t.split('\n').map(String::from).collect())
             .unwrap_or_default(),
+        note: r.get(9)?,
+        title: r.get(10)?,
     })
 }
 
@@ -1075,6 +1713,89 @@ fn valid_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_old_fleet_gets_a_lowercase_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("via.db");
+        {
+            let db = Db::open(&path).unwrap();
+            for f in ["McTrack", "Taken", "taken"] {
+                db.conn
+                    .lock()
+                    .unwrap()
+                    .execute("INSERT INTO fleets (name) VALUES (?1)", [f])
+                    .unwrap();
+            }
+            db.set_variable(&Variable {
+                scope: "fleet".into(),
+                target: "McTrack".into(),
+                app: String::new(),
+                service: None,
+                key: "SITE".into(),
+                value: b"x".to_vec(),
+                secret: false,
+                updated_at: 0,
+                updated_by: "t".into(),
+            })
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let fleets = db.fleets().unwrap();
+        let names: Vec<(&str, &str)> = fleets
+            .iter()
+            .map(|f| (f.name.as_str(), f.title.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [("Taken", ""), ("mctrack", "McTrack"), ("taken", "")]
+        );
+        assert_eq!(db.variables().unwrap()[0].target, "mctrack");
+    }
+
+    #[test]
+    fn slugs_are_lowercase_dashes() {
+        assert_eq!(slug("Line 7 (Plant 2)").unwrap(), "line-7-plant-2");
+        assert_eq!(slug("  Ünïcode__Scale!! ").unwrap(), "n-code-scale");
+        assert_eq!(slug(&"a".repeat(80)).unwrap().len(), 63);
+        assert!(slug("!!!").is_err());
+    }
+
+    #[test]
+    fn a_device_slug_is_never_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("via.db")).unwrap();
+        db.create_fleet("line").unwrap();
+        let mut names = Vec::new();
+        for title in ["Packing scale", ""] {
+            for _ in 0..2 {
+                let token = db.mint_token("line", None, title, 60, None).unwrap();
+                let (d, _, _) = db
+                    .enroll(&Enrollment {
+                        token,
+                        hostname: "ViaOS".into(),
+                        arch: None,
+                        os_version: None,
+                        agent_version: None,
+                    })
+                    .unwrap();
+                names.push((d.name, d.title));
+            }
+        }
+        let names: Vec<(&str, &str)> = names
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("viaos", "Packing scale"),
+                ("viaos-2", "Packing scale"),
+                ("viaos-3", ""),
+                ("viaos-4", "")
+            ]
+        );
+    }
 
     fn variable(service: Option<&str>, value: &str) -> Variable {
         Variable {
@@ -1202,7 +1923,7 @@ mod tests {
         assert!(db.set_fleet_parent("acme", Some("acme")).is_err());
         assert!(db.set_fleet_parent("house", Some("nope")).is_err());
 
-        let token = db.mint_token("house", None, 60, None).unwrap();
+        let token = db.mint_token("house", None, "", 60, None).unwrap();
         let (device, _, _) = db.enroll(&enrollment(&token)).unwrap();
         assert_eq!(db.devices(Some("acme")).unwrap()[0].id, device.id);
         assert!(db.devices(Some("other")).unwrap().is_empty());
@@ -1249,7 +1970,7 @@ mod tests {
                 .to_string()
                 .contains("under it")
         );
-        let token = db.mint_token("site", None, 60, None).unwrap();
+        let token = db.mint_token("site", None, "", 60, None).unwrap();
         db.delete_fleet("site").unwrap();
         assert!(
             db.enroll(&enrollment(&token)).is_err(),
@@ -1260,7 +1981,7 @@ mod tests {
         assert!(db.delete_fleet("acme").is_err());
 
         db.create_fleet("full").unwrap();
-        let token = db.mint_token("full", None, 60, None).unwrap();
+        let token = db.mint_token("full", None, "", 60, None).unwrap();
         db.enroll(&enrollment(&token)).unwrap();
         assert!(
             db.delete_fleet("full")
@@ -1352,7 +2073,7 @@ mod tests {
         let (_d, db) = db();
         db.create_fleet("line").unwrap();
         let token = db
-            .mint_token("line", Some("line-07"), 3600, Some("img"))
+            .mint_token("line", Some("line-07"), "", 3600, Some("img"))
             .unwrap();
         let (device, cred, image) = db.enroll(&enrollment(&token)).unwrap();
         assert_eq!(image.as_deref(), Some("img"));
@@ -1367,7 +2088,7 @@ mod tests {
     fn expired_and_unknown_tokens_are_refused() {
         let (_d, db) = db();
         db.create_fleet("line").unwrap();
-        let token = db.mint_token("line", None, -1, None).unwrap();
+        let token = db.mint_token("line", None, "", -1, None).unwrap();
         assert!(db.enroll(&enrollment(&token)).is_err());
         assert!(db.enroll(&enrollment("nope")).is_err());
     }
@@ -1377,9 +2098,19 @@ mod tests {
         let (_d, db) = db();
         db.create_fleet("line").unwrap();
         for _ in 0..2 {
-            let t = db.mint_token("line", Some("dup"), 60, None).unwrap();
+            let t = db.mint_token("line", Some("dup"), "", 60, None).unwrap();
             db.enroll(&enrollment(&t)).unwrap();
         }
+        // Enrolling keeps slugs apart; a server from before that may not have.
+        assert_ne!(
+            db.resolve("dup").unwrap().id,
+            db.resolve("dup-2").unwrap().id
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE devices SET name = 'dup'", [])
+            .unwrap();
         assert!(db.resolve("dup").is_err());
     }
 
@@ -1461,6 +2192,17 @@ mod tests {
         // Opening again changes nothing.
         drop(db);
         assert_eq!(Db::open(&path).unwrap().grants().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_new_server_starts_with_nobody_but_admins() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("via.db")).unwrap();
+        assert!(db.grants().unwrap().is_empty());
+        drop(db);
+        // And opening it again changes nothing.
+        let db = Db::open(&dir.path().join("via.db")).unwrap();
+        assert!(db.grants().unwrap().is_empty());
     }
 
     #[test]

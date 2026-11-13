@@ -3,7 +3,7 @@ import { lazy, Suspense, useState } from "react";
 import { diff, format, parse, type Change } from "../envtext";
 import { ago, tool, type Schema, type SchemaVariable, type Variable } from "../lib";
 import { useCan } from "./fleet";
-import { Badge, Button, Checkbox, Combobox, Empty, Failure, Input, Section } from "../ui";
+import { Badge, Button, Checkbox, Combobox, Failure, Input, Section } from "../ui";
 
 const Editor = lazy(() => import("../editor"));
 
@@ -184,7 +184,7 @@ function AddRow({ at, app, schema, onDone, onCancel }: { at: Scope; app: string;
       }}
     >
       <Combobox creatable mono required aria-label="Name" className={stack} value={key} onChange={(k) => setKey(k.toUpperCase())} placeholder="NAME" options={(schema?.variables ?? []).map((v) => ({ value: v.key, label: v.key, detail: v.description ?? undefined, badge: v.required ? "required" : undefined }))} />
-      <Combobox aria-label="Service" mono creatable={services.length === 0} className={stack} value={service} onChange={setService} placeholder="all" options={[{ value: "", label: "all" }, ...services.map((s) => ({ value: s, label: s }))]} />
+      {app ? <Combobox aria-label="Service" mono creatable={services.length === 0} className={stack} value={service} onChange={setService} placeholder="all" options={[{ value: "", label: "all" }, ...services.map((s) => ({ value: s, label: s }))]} /> : <span className={`font-mono text-xs text-ink-3 ${stack}`}>all</span>}
       <div className={`flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 ${stack} sm:col-span-2`}>
         <Input required aria-label="Value" type={secret ? "password" : "text"} autoComplete="new-password" spellCheck={false} placeholder="value" className="min-w-0 flex-1 font-mono" value={value} onChange={(e) => setValue(e.target.value)} />
         <Checkbox checked={secret} onChange={(e) => setPicked(e.target.checked)}>
@@ -219,7 +219,7 @@ function TextMode({ at, app, own, inherited, declared, onDone }: { at: Scope; ap
   return (
     <div className="py-3">
       <Suspense fallback={<div className="h-36 border border-rule bg-well" />}>
-        <Editor key={generation} value={text} onChange={setText} label={`Variables of ${app}`} />
+        <Editor key={generation} value={text} onChange={setText} label={app ? `Variables of ${app}` : "Variables for every app"} />
       </Suspense>
       <div className="mt-2 flex flex-wrap items-center justify-between gap-3">
         <p className="min-w-0 text-xs text-ink-3">
@@ -252,7 +252,7 @@ function TextMode({ at, app, own, inherited, declared, onDone }: { at: Scope; ap
   );
 }
 
-function AppVariables({ app, at, own, inherited, schema, admin }: { app: string; at: Scope; own: Variable[]; inherited: Variable[]; schema?: Schema; admin: boolean }) {
+function AppVariables({ app, at, own, inherited, schema, suggest, admin }: { app: string; at: Scope; own: Variable[]; inherited: Variable[]; schema?: Schema; suggest?: Schema; admin: boolean }) {
   const [mode, setMode] = useState<"table" | "text">("table");
   const [adding, setAdding] = useState(false);
   const [note, setNote] = useState("");
@@ -269,12 +269,13 @@ function AppVariables({ app, at, own, inherited, schema, admin }: { app: string;
     ...declared.map((d): RowData => ({ key: d.key, service: d.services.length === 1 ? d.services[0] : null, value: d.default, secret: d.secret, kind: "declared", required: d.required, description: d.description, where: d.required && d.default == null ? <Badge tone="warn">required</Badge> : "release default" })),
   ].sort((a, b) => a.key.localeCompare(b.key) || (a.service ?? "").localeCompare(b.service ?? ""));
 
+  const label = app || "Every app";
   return (
     <Section
-      title={app}
+      title={label}
       aside={
         admin ? (
-          <span className="flex gap-1" role="group" aria-label={`Edit ${app} as`}>
+          <span className="flex gap-1" role="group" aria-label={`Edit ${label} as`}>
             {(["table", "text"] as const).map((m) => (
               <Button key={m} tone={mode === m ? "plain" : "quiet"} size="sm" aria-pressed={mode === m} onClick={() => setMode(m)}>
                 {m}
@@ -298,8 +299,8 @@ function AppVariables({ app, at, own, inherited, schema, admin }: { app: string;
           {rows.map((r) => (
             <ValueRow key={`${r.kind}/${r.origin ?? ""}/${r.service ?? ""}/${r.key}/${r.value}`} r={r} admin={admin} at={at} app={app} onDone={setNote} />
           ))}
-          {rows.length === 0 && !adding && <p className="row text-sm text-ink-3">Nothing set for {app} yet.</p>}
-          {adding && <AddRow at={at} app={app} schema={schema} onDone={setNote} onCancel={() => setAdding(false)} />}
+          {rows.length === 0 && !adding && <p className="row text-sm text-ink-3">{app ? `Nothing set for ${app} yet.` : "Nothing set for every app yet. A value here reaches each service, in any app, that lists its name in its compose environment."}</p>}
+          {adding && <AddRow at={at} app={app} schema={schema ?? suggest} onDone={setNote} onCancel={() => setAdding(false)} />}
           {admin && !adding && (
             <div className="py-1.5">
               <Button tone="quiet" size="sm" onClick={() => setAdding(true)}>
@@ -326,17 +327,15 @@ export function ScopeVariables({ scope, target, inherits, app: runningApp }: { s
   // Nearest first, the order they take effect in reverse.
   const inherited = [...inherits].reverse().flatMap((f) => (vars.data?.variables ?? []).filter((v) => v.scope === "fleet" && v.target === f));
   const offered = scope === "fleet" ? (releases.data ?? []).map((r) => r.app) : runningApp ? [runningApp] : [];
-  const apps = [...new Set([...own.map((v) => v.app), ...inherited.map((v) => v.app), ...offered])].sort();
+  // "" is every app, and comes first.
+  const apps = ["", ...[...new Set([...own.map((v) => v.app), ...inherited.map((v) => v.app), ...offered])].filter(Boolean).sort()];
+  // For every app, any app's declared names are worth suggesting.
+  const everyApp: Schema = { app: "", release: "", variables: [...new Map(schemas.flatMap((s) => s.variables).map((v) => [v.key, { ...v, services: [] }])).values()] };
   return (
     <div className="min-w-0">
       <Failure error={vars.error} />
-      {vars.isSuccess && releases.isSuccess && apps.length === 0 && (
-        <Section title="Variables">
-          <Empty title="No apps here yet.">Variables belong to an app. Upload a release, then set its values here.</Empty>
-        </Section>
-      )}
       {apps.map((app) => (
-        <AppVariables key={app} app={app} at={{ scope, target }} own={own.filter((v) => v.app === app)} inherited={inherited.filter((v) => v.app === app)} schema={schemas.find((s) => s.app === app)} admin={admin} />
+        <AppVariables key={app} app={app} at={{ scope, target }} own={own.filter((v) => v.app === app)} inherited={inherited.filter((v) => v.app === app)} schema={app ? schemas.find((s) => s.app === app) : undefined} suggest={app ? undefined : everyApp} admin={admin} />
       ))}
     </div>
   );

@@ -56,8 +56,8 @@ enum Command {
         /// Use images already present locally instead of `docker build`.
         #[arg(long)]
         no_build: bool,
-        /// The signing key. Defaults to `~/.config/via/signing.key`, made if
-        /// it doesn't exist.
+        /// A key to sign it with, for servers that set VIA_TRUSTED_KEYS.
+        /// Without one it goes out unsigned.
         #[arg(long, env = "VIA_SIGNING_KEY")]
         sign_key: Option<PathBuf>,
     },
@@ -69,12 +69,11 @@ enum Command {
     /// Sign and upload an OS update: the output of `nix build .#updates.<arch>`.
     OsRelease {
         dir: PathBuf,
-        /// The signing key. Defaults to `~/.config/via/signing.key`, made if
-        /// it doesn't exist.
+        /// A key to sign it with, for servers that set VIA_TRUSTED_KEYS.
+        /// Without one it goes out unsigned.
         #[arg(long, env = "VIA_SIGNING_KEY")]
         sign_key: Option<PathBuf>,
-        /// The Secure Boot keys. Defaults to `~/.config/via/secure-boot`, made
-        /// if they don't exist.
+        /// Secure Boot keys to sign it with. Without them, Secure Boot is off.
         #[arg(long, env = "VIA_SECURE_BOOT_KEYS")]
         secure_boot: Option<PathBuf>,
     },
@@ -86,8 +85,8 @@ enum Command {
         /// among all its device types.
         #[arg(long = "device-type", visible_alias = "arch")]
         arch: String,
-        /// The Secure Boot keys it's signed with and devices enroll. Defaults
-        /// to `~/.config/via/secure-boot`, made if they don't exist.
+        /// Secure Boot keys to sign it with, which devices in setup mode then
+        /// enroll. Without them, Secure Boot is off.
         #[arg(long, env = "VIA_SECURE_BOOT_KEYS")]
         secure_boot: Option<PathBuf>,
     },
@@ -346,7 +345,7 @@ async fn main() -> Result<()> {
                     number,
                     arch,
                     no_build,
-                    Some(keys::signing_key(sign_key)?),
+                    keys::signing_key(sign_key)?,
                 )
             })
             .await??;
@@ -361,11 +360,16 @@ async fn main() -> Result<()> {
             let remote = remote::Remote::from_env()?;
             let r = tokio::task::spawn_blocking(move || {
                 let sign_key = keys::signing_key(sign_key)?;
-                let boot_keys = keys::secure_boot_keys(secure_boot)?;
-                let signed = secureboot::sign_update(&boot_keys, &dir)?;
-                let r = remote::os_release(&remote, &signed, &sign_key);
-                let _ = std::fs::remove_dir_all(&signed);
-                r
+                let sign_key = sign_key.as_deref();
+                match keys::secure_boot_keys(secure_boot)? {
+                    Some(boot_keys) => {
+                        let signed = secureboot::sign_update(&boot_keys, &dir)?;
+                        let r = remote::os_release(&remote, &signed, sign_key);
+                        let _ = std::fs::remove_dir_all(&signed);
+                        r
+                    }
+                    None => remote::os_release(&remote, &dir, sign_key),
+                }
             })
             .await??;
             print_json(&r)?;
@@ -378,7 +382,7 @@ async fn main() -> Result<()> {
             let remote = remote::Remote::from_env()?;
             let r = tokio::task::spawn_blocking(move || {
                 let boot_keys = keys::secure_boot_keys(secure_boot)?;
-                remote::base_image(&remote, &raw, &arch, &boot_keys)
+                remote::base_image(&remote, &raw, &arch, boot_keys.as_deref())
             })
             .await??;
             print_json(&r)?;

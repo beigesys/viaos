@@ -17,6 +17,8 @@
 //! - `GET  /v1/devices/{device}/tunnel/{port}`  a TCP stream to a port on a
 //!   device, over its connection (WebSocket, admin)
 //! - `/mcp`                   fleet MCP, Streamable HTTP, bearer token
+//! - `/authorize`, `/token`, `/register`  how an MCP client signs in with
+//!   GitHub (see `oauth`)
 //!
 //! People authenticate with API tokens made by `via-server token create`.
 //! Admins may do everything; anyone else what grants give them, fleet by
@@ -24,10 +26,13 @@
 
 mod access;
 mod db;
+mod fetch;
 mod github;
 mod hub;
 mod image;
+mod limit;
 mod mcp;
+mod oauth;
 mod os;
 mod os_track;
 mod releases;
@@ -138,6 +143,11 @@ struct Serve {
     /// Base viaos images, named `viaos-<arch>.raw`.
     #[arg(long, env = "VIA_IMAGES_DIR")]
     images_dir: Option<PathBuf>,
+    /// Where to fetch a base image from when there is none for an
+    /// architecture: `<source>/viaos-<arch>.raw.zst`. Defaults to the latest
+    /// viaos release on GitHub; `none` turns it off.
+    #[arg(long, env = "VIA_IMAGE_SOURCE", default_value = fetch::DEFAULT_SOURCE)]
+    image_source: String,
     /// OS updates, as `<arch>/<version>/` holding `nix build .#updates.<arch>`.
     #[arg(long, env = "VIA_OS_DIR")]
     os_dir: Option<PathBuf>,
@@ -174,6 +184,12 @@ struct Serve {
     /// A GitHub Enterprise Server's address.
     #[arg(long, env = "VIA_GITHUB_URL", default_value = "https://github.com")]
     github_url: String,
+    /// How many proxies in front of this server add to X-Forwarded-For: 1
+    /// behind one nginx or load balancer, 2 on Railway (its edge adds itself
+    /// after the client). Requests from people not signed in are limited per
+    /// address; at 0 the address is the peer's.
+    #[arg(long, env = "VIA_TRUST_PROXY", default_value_t = 0)]
+    trust_proxy: usize,
 }
 
 pub struct State {
@@ -189,6 +205,7 @@ pub struct State {
     admin_token_hash: Option<String>,
     pub secrets: secrets::Secrets,
     pub github: Option<github::Config>,
+    pub limiter: limit::Limiter,
 }
 
 impl State {
@@ -316,13 +333,23 @@ async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
         admin_token_hash: cli.admin_token.as_deref().map(db::hash),
         secrets,
         github,
+        limiter: limit::Limiter::new(cli.trust_proxy),
     });
     tokio::spawn(os_track::run(state.clone()));
+    tokio::spawn(oauth::tidy(state.clone()));
+    if cli.image_source != "none" {
+        tokio::spawn(fetch::run(state.clone(), cli.image_source.clone()));
+    }
     let app = router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(cli.listen).await?;
     tracing::info!("listening on {} as {}", cli.listen, state.public_url);
-    axum::serve(listener, app).await.context("server stopped")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("server stopped")
 }
 
 fn router(state: Arc<State>) -> Router {
@@ -354,19 +381,50 @@ fn router(state: Arc<State>) -> Router {
             state.clone(),
             require_caller,
         ));
-    Router::new()
+    // Nobody is signed in here, so each request spends from its address's
+    // budget.
+    let anonymous = Router::new()
+        .route("/v1/session", post(sign_in))
+        .route("/v1/auth/github", get(github::start))
+        .route("/v1/auth/github/callback", get(github::callback))
+        .route("/register", post(oauth::register))
+        .route("/authorize", get(oauth::authorize))
+        .route("/token", post(oauth::token))
+        .route("/oauth/request", get(oauth::pending))
+        .route("/oauth/decide", post(oauth::decide))
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(state.clone(), limit::every));
+    let enrolling = Router::new()
         .route("/v1/enroll", post(enroll))
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            limit::failures,
+        ));
+    Router::new()
         .route("/v1/connect", get(connect))
         .route("/v1/images/{id}", get(download))
         .route("/v1/os/{arch}/{version}/{file}", get(os_file))
         .route("/v1/releases/{app}/{release}/{arch}", get(release_bundle))
         .route("/healthz", get(|| async { "ok" }))
-        .route("/v1/session", post(sign_in).delete(sign_out))
+        .route("/v1/session", axum::routing::delete(sign_out))
         .route("/v1/auth", get(github::options))
-        .route("/v1/auth/github", get(github::start))
-        .route("/v1/auth/github/callback", get(github::callback))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth::protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(oauth::protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth::authorization_server),
+        )
         .fallback(web::serve)
         .with_state(state.clone())
+        .merge(anonymous)
+        .merge(enrolling)
         .merge(people)
         .merge(admin)
 }
@@ -389,6 +447,7 @@ fn test_state(
         admin_token_hash: None,
         secrets: secrets::Secrets::open(dir, None).unwrap(),
         github,
+        limiter: limit::Limiter::new(0),
     })
 }
 
@@ -403,8 +462,21 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 /// Authenticate an API token and attach the [`db::Caller`] to the request.
 async fn require_caller(AxState(s): AxState<Arc<State>>, mut req: Request, next: Next) -> Response {
     let by_cookie = bearer(req.headers()).is_none();
+    let mcp = req.uri().path() == "/mcp";
+    let unauthorized = |message: &'static str| {
+        let mut res = (StatusCode::UNAUTHORIZED, message).into_response();
+        if let (true, Some(v)) = (mcp, oauth::challenge(&s)) {
+            res.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+        }
+        res
+    };
     let Some(token) = bearer(req.headers()).or_else(|| session_cookie(req.headers())) else {
-        return (StatusCode::UNAUTHORIZED, "API token required").into_response();
+        // Every MCP client asks once without a token to find out how to sign
+        // in, so this spends from the budget like any anonymous request.
+        return match s.limiter.take(s.limiter.client(&req)) {
+            Ok(()) => unauthorized("API token required"),
+            Err(wait) => limit::too_many(wait),
+        };
     };
     // A browser sends its cookie wherever a page asks it to, so a cookie only
     // counts from our own pages.
@@ -415,6 +487,10 @@ async fn require_caller(AxState(s): AxState<Arc<State>>, mut req: Request, next:
         Some(db::Caller::admin("admin"))
     } else if by_cookie && token.starts_with(db::SESSION_PREFIX) {
         s.db.session_caller(token).ok().flatten()
+    } else if token.starts_with(oauth::ACCESS_PREFIX) {
+        // Issued for /mcp, and good for nothing else.
+        mcp.then(|| s.db.oauth_caller(token).ok().flatten())
+            .flatten()
     } else {
         s.db.api_caller(token).ok().flatten()
     };
@@ -423,7 +499,10 @@ async fn require_caller(AxState(s): AxState<Arc<State>>, mut req: Request, next:
             req.extensions_mut().insert(c);
             next.run(req).await
         }
-        None => (StatusCode::UNAUTHORIZED, "unknown API token").into_response(),
+        None => match s.limiter.take(s.limiter.client(&req)) {
+            Ok(()) => unauthorized("unknown API token"),
+            Err(wait) => limit::too_many(wait),
+        },
     }
 }
 

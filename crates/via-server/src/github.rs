@@ -3,9 +3,11 @@
 //! Organisation owners are admins, and so is anyone on the configured admin
 //! team. Other members get what grants give them (see [`crate::access`]):
 //! as themselves, as members of a team a grant names, and as members of the
-//! organisation. A member with no grant at all is turned away. GitHub's access token is used for those checks and then dropped.
-//! Access lasts as long as the session, so someone removed from the
-//! organisation loses it within [`SESSION_SECS`].
+//! organisation. A member with no grant at all is turned away. For a console
+//! sign-in GitHub's access token is used for those checks and then dropped,
+//! and access lasts as long as the session, so someone removed from the
+//! organisation loses it within [`SESSION_SECS`]. [`crate::oauth`] uses the
+//! same sign-in for MCP clients.
 
 use std::sync::Arc;
 
@@ -49,6 +51,8 @@ pub enum Refused {
     NotMember,
     NoAccess,
     Restricted,
+    /// GitHub no longer honours the token we kept.
+    Revoked,
 }
 
 impl Refused {
@@ -57,6 +61,7 @@ impl Refused {
             Refused::NotMember => "not_member",
             Refused::NoAccess => "no_access",
             Refused::Restricted => "restricted",
+            Refused::Revoked => "failed",
         }
     }
 }
@@ -65,7 +70,7 @@ fn back_to_console(code: &str) -> Response {
     Redirect::to(&format!("/?auth={code}")).into_response()
 }
 
-fn secure(s: &State) -> &'static str {
+pub fn secure(s: &State) -> &'static str {
     if s.public_url.starts_with("https://") {
         "; Secure"
     } else {
@@ -87,23 +92,27 @@ pub async fn start(AxState(s): AxState<Arc<State>>) -> Response {
     let Some(g) = &s.github else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let state = db::random_secret();
+    send_to_github(&s, g, &db::random_secret())
+}
+
+/// Start a sign-in; `state` is what comes back to [`callback`].
+pub fn send_to_github(s: &State, g: &Config, state: &str) -> Response {
     let url = format!(
         "{}/login/oauth/authorize?client_id={}&scope=read:org&state={state}&redirect_uri={}",
         g.url,
         encode(&g.client_id),
-        encode(&callback_url(&s)),
+        encode(&callback_url(s)),
     );
     // Lax, unlike the session: it has to arrive on GitHub's redirect back.
     let cookie = format!(
         "{STATE_COOKIE}={state}; Path=/v1/auth/github; HttpOnly; SameSite=Lax; Max-Age=600{}",
-        secure(&s)
+        secure(s)
     );
     ([(header::SET_COOKIE, cookie)], Redirect::to(&url)).into_response()
 }
 
 /// Percent-encode a query value.
-fn encode(v: &str) -> String {
+pub fn encode(v: &str) -> String {
     v.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
@@ -121,7 +130,7 @@ pub struct Callback {
     error: Option<String>,
 }
 
-fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get_all(header::COOKIE)
         .iter()
@@ -150,29 +159,26 @@ pub async fn callback(
     let Some(code) = &q.code else {
         return back_to_console("failed");
     };
-    // Only teams some grant names are worth asking GitHub about.
-    let teams: Vec<String> = match s.db.grants() {
-        Ok(g) => g
-            .into_iter()
-            .filter_map(|g| g.subject.strip_prefix("github-team:").map(String::from))
-            .collect(),
+    let teams = match granted_teams(&s) {
+        Ok(t) => t,
         Err(e) => {
             tracing::error!("reading grants: {e:#}");
             return back_to_console("failed");
         }
     };
-    let identified = identify(g, &callback_url(&s), code, &teams)
-        .await
-        .map(|(login, caller)| {
-            let caller = caller.and_then(|c| match crate::access::Access::load(&s.db, &c) {
-                Ok(a) if a.any() => Ok(c),
-                _ => Err(Refused::NoAccess),
+    let identified =
+        identify(g, &callback_url(&s), code, &teams)
+            .await
+            .map(|(token, login, caller)| {
+                let caller = caller.and_then(|c| match crate::access::Access::load(&s.db, &c) {
+                    Ok(a) if a.any() => Ok(c),
+                    _ => Err(Refused::NoAccess),
+                });
+                (token, login, caller)
             });
-            (login, caller)
-        });
-    let caller = match identified {
-        Ok((_, Ok(caller))) => caller,
-        Ok((login, Err(refused))) => {
+    let (token, caller) = match identified {
+        Ok((token, _, Ok(caller))) => (token, caller),
+        Ok((_, login, Err(refused))) => {
             s.db.audit(
                 &format!("github/{login}"),
                 "sign_in",
@@ -186,6 +192,32 @@ pub async fn callback(
             return back_to_console("failed");
         }
     };
+    let secure = secure(&s);
+    let clear_state =
+        format!("{STATE_COOKIE}=; Path=/v1/auth/github; HttpOnly; SameSite=Lax; Max-Age=0{secure}");
+    // An MCP client asked for this sign-in: on to its consent page.
+    let client_request = q.state.as_deref().and_then(|id| {
+        s.db.oauth_identified(id, &caller, &s.secrets.seal_github(&token))
+            .ok()
+            .flatten()
+    });
+    if let Some(id) = client_request {
+        let consent = format!(
+            "{}={id}; Path=/oauth; HttpOnly; SameSite=Lax; Max-Age={}{secure}",
+            crate::oauth::CONSENT_COOKIE,
+            crate::oauth::REQUEST_SECS
+        );
+        let mut res = Redirect::to("/connect").into_response();
+        for c in [consent, clear_state] {
+            match HeaderValue::from_str(&c) {
+                Ok(v) => {
+                    res.headers_mut().append(header::SET_COOKIE, v);
+                }
+                Err(_) => return back_to_console("failed"),
+            }
+        }
+        return res;
+    }
     let name = caller.name.clone();
     let session = match s.db.create_session(&caller, SESSION_SECS) {
         Ok(t) => t,
@@ -195,7 +227,6 @@ pub async fn callback(
         }
     };
     s.db.audit(&name, "sign_in", &json!({ "via": "github" }), true);
-    let secure = secure(&s);
     let mut res = Redirect::to("/").into_response();
     let cookies = res.headers_mut();
     for c in [
@@ -203,7 +234,7 @@ pub async fn callback(
             "{}={session}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECS}{secure}",
             crate::SESSION_COOKIE
         ),
-        format!("{STATE_COOKIE}=; Path=/v1/auth/github; HttpOnly; SameSite=Lax; Max-Age=0{secure}"),
+        clear_state,
     ] {
         match HeaderValue::from_str(&c) {
             Ok(v) => {
@@ -232,19 +263,31 @@ struct Membership {
     role: Option<String>,
 }
 
-/// Turn the code into who this is and what they may do.
+fn http() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent("via-server")
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
+/// Only teams some grant names are worth asking GitHub about.
+pub fn granted_teams(s: &State) -> Result<Vec<String>> {
+    Ok(s.db
+        .grants()?
+        .into_iter()
+        .filter_map(|g| g.subject.strip_prefix("github-team:").map(String::from))
+        .collect())
+}
+
+/// Turn the code into GitHub's token, who this is, and what they may do.
 async fn identify(
     g: &Config,
     redirect_uri: &str,
     code: &str,
     teams: &[String],
-) -> Result<(String, Result<Caller, Refused>)> {
-    let http = reqwest::Client::builder()
-        .user_agent("via-server")
-        .timeout(std::time::Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-    let reply: TokenReply = http
+) -> Result<(String, String, Result<Caller, Refused>)> {
+    let reply: TokenReply = http()?
         .post(format!("{}/login/oauth/access_token", g.url))
         .header(header::ACCEPT, "application/json")
         .json(&json!({
@@ -263,17 +306,31 @@ async fn identify(
     let Some(token) = reply.access_token else {
         bail!("GitHub gave no token: {}", reply.error.unwrap_or_default());
     };
+    let (login, caller) = check(g, &token, teams).await?;
+    Ok((token, login, caller))
+}
+
+/// Ask GitHub who holds `token` and what they may do now.
+pub async fn check(
+    g: &Config,
+    token: &str,
+    teams: &[String],
+) -> Result<(String, Result<Caller, Refused>)> {
+    let http = http()?;
     let api = g.api();
     let get = |url: String| {
         http.get(url)
-            .bearer_auth(&token)
+            .bearer_auth(token)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
     };
 
-    let User { login } = get(format!("{api}/user"))
-        .await?
+    let res = get(format!("{api}/user")).await?;
+    if res.status() == StatusCode::UNAUTHORIZED {
+        return Ok((String::new(), Err(Refused::Revoked)));
+    }
+    let User { login } = res
         .error_for_status()?
         .json()
         .await
@@ -345,6 +402,8 @@ mod tests {
         /// team slug -> its active members
         teams: HashMap<String, Vec<String>>,
         restricted: bool,
+        /// Logins since removed from the organisation.
+        removed: Mutex<Vec<String>>,
         /// What the token exchange was sent.
         exchanged: Mutex<Vec<Value>>,
     }
@@ -390,6 +449,9 @@ mod tests {
                         assert_eq!(org, "beigesys");
                         if c.restricted {
                             return StatusCode::FORBIDDEN.into_response();
+                        }
+                        if c.removed.lock().unwrap().contains(&who(&h)) {
+                            return StatusCode::NOT_FOUND.into_response();
                         }
                         match c.members.get(&who(&h)).map(String::as_str) {
                             None => StatusCode::NOT_FOUND.into_response(),
@@ -590,6 +652,10 @@ mod tests {
     #[tokio::test]
     async fn membership_decides_the_role() {
         let r = rig(org()).await;
+        r.state
+            .db
+            .set_grant("github-org", None, crate::access::Level::Observer)
+            .unwrap();
         assert_eq!(
             r.role_of("owner").await,
             ("github/owner".into(), "admin".into())
@@ -631,7 +697,6 @@ mod tests {
         use crate::access::Level;
         let r = rig(org()).await;
         let db = &r.state.db;
-        db.delete_grant("github-org", None).unwrap();
         db.create_fleet("line-07").unwrap();
         db.set_grant("github-team:line", Some("line-07"), Level::Developer)
             .unwrap();
@@ -735,6 +800,438 @@ mod tests {
             .unwrap();
         assert_eq!(out.status(), StatusCode::NO_CONTENT);
         assert_eq!(r.whoami(&cookie).await.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// An MCP client, up to the point its code is in hand.
+    struct Client {
+        id: String,
+        redirect: String,
+    }
+
+    impl Rig {
+        async fn register(&self) -> Client {
+            let redirect = "http://localhost:4000/cb".to_string();
+            let res: Value = self
+                .http
+                .post(format!("{}/register", self.url))
+                .json(&json!({ "client_name": "Claude", "redirect_uris": [redirect] }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            Client {
+                id: res["client_id"].as_str().unwrap().into(),
+                redirect,
+            }
+        }
+
+        /// As far as the consent page; returns the consent cookie.
+        async fn consent(&self, c: &Client, login: &str) -> String {
+            let start = self
+                .http
+                .get(format!(
+                    "{}/authorize?response_type=code&client_id={}&state=theirs\
+                     &redirect_uri={}&code_challenge={CHALLENGE}&code_challenge_method=S256\
+                     &resource={}",
+                    self.url,
+                    c.id,
+                    encode("http://localhost:5555/cb"),
+                    encode(&format!("{}/mcp", self.url)),
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(start.status(), StatusCode::SEE_OTHER);
+            let to = location(&start);
+            assert!(to.contains("/login/oauth/authorize"), "{to}");
+            let state = to
+                .split("state=")
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .next()
+                .unwrap();
+            let back = self
+                .http
+                .get(format!(
+                    "{}/v1/auth/github/callback?code=code-{login}&state={state}",
+                    self.url
+                ))
+                .header(header::COOKIE, format!("{STATE_COOKIE}={state}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(location(&back), "/connect");
+            assert!(
+                !set_cookies(&back)
+                    .iter()
+                    .any(|c| c.starts_with("via_session=")),
+                "an MCP sign-in is no console session"
+            );
+            let all = set_cookies(&back);
+            let c = all.iter().find(|c| c.starts_with("via_consent=")).unwrap();
+            assert!(c.contains("SameSite=Lax") && c.contains("HttpOnly"), "{c}");
+            c.split(';').next().unwrap().to_string()
+        }
+
+        async fn decide(&self, cookie: &str, allow: bool) -> reqwest::Response {
+            let id = cookie.split('=').nth(1).unwrap();
+            self.http
+                .post(format!("{}/oauth/decide", self.url))
+                .header(header::COOKIE, cookie)
+                .json(&json!({ "request": db::hash(id), "allow": allow }))
+                .send()
+                .await
+                .unwrap()
+        }
+
+        async fn code(&self, c: &Client, login: &str) -> String {
+            let cookie = self.consent(c, login).await;
+            let v: Value = self.decide(&cookie, true).await.json().await.unwrap();
+            let to = v["redirect"].as_str().unwrap();
+            assert!(to.starts_with("http://localhost:5555/cb?code="), "{to}");
+            assert!(to.ends_with("&state=theirs"), "{to}");
+            to.split("code=")
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .next()
+                .unwrap()
+                .to_string()
+        }
+
+        async fn token(&self, form: &[(&str, &str)]) -> (StatusCode, Value) {
+            let res = self
+                .http
+                .post(format!("{}/token", self.url))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(
+                    form.iter()
+                        .map(|(k, v)| format!("{k}={}", encode(v)))
+                        .collect::<Vec<_>>()
+                        .join("&"),
+                )
+                .send()
+                .await
+                .unwrap();
+            let status = res.status();
+            (status, res.json().await.unwrap())
+        }
+
+        async fn trade(&self, c: &Client, code: &str, verifier: &str) -> (StatusCode, Value) {
+            self.token(&[
+                ("grant_type", "authorization_code"),
+                ("client_id", &c.id),
+                ("code", code),
+                ("redirect_uri", "http://localhost:5555/cb"),
+                ("code_verifier", verifier),
+            ])
+            .await
+        }
+
+        async fn refresh(&self, c: &Client, token: &str) -> (StatusCode, Value) {
+            self.token(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", &c.id),
+                ("refresh_token", token),
+            ])
+            .await
+        }
+
+        /// A connection: its access and refresh tokens.
+        async fn connect(&self, c: &Client, login: &str) -> (String, String) {
+            let code = self.code(c, login).await;
+            let (status, t) = self.trade(c, &code, VERIFIER).await;
+            assert_eq!(status, StatusCode::OK, "{t}");
+            (
+                t["access_token"].as_str().unwrap().into(),
+                t["refresh_token"].as_str().unwrap().into(),
+            )
+        }
+
+        async fn mcp(&self, token: &str, method: &str, mut params: Value) -> reqwest::Response {
+            params["_meta"] = json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": { "name": "t", "version": "0" },
+                "io.modelcontextprotocol/clientCapabilities": {},
+            });
+            let mut req = self
+                .http
+                .post(format!("{}/mcp", self.url))
+                .bearer_auth(token)
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2026-07-28")
+                .header("Mcp-Method", method);
+            if let Some(name) = params["name"].as_str() {
+                req = req.header("Mcp-Name", name);
+            }
+            req.json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
+                .send()
+                .await
+                .unwrap()
+        }
+
+        async fn fleets(&self, token: &str) -> Vec<String> {
+            let res = self
+                .mcp(
+                    token,
+                    "tools/call",
+                    json!({ "name": "list_fleets", "arguments": {} }),
+                )
+                .await;
+            assert_eq!(res.status(), StatusCode::OK);
+            let v: Value = res.json().await.unwrap();
+            let text = v["result"]["content"][0]["text"].as_str().unwrap();
+            let v: Value = serde_json::from_str(text).unwrap();
+            v["fleets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["name"].as_str().unwrap().to_string())
+                .collect()
+        }
+    }
+
+    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    async fn connected_rig() -> Rig {
+        let r = rig(org()).await;
+        let db = &r.state.db;
+        db.create_fleet("line-07").unwrap();
+        db.create_fleet("other").unwrap();
+        db.set_grant(
+            "github:plain",
+            Some("line-07"),
+            crate::access::Level::Observer,
+        )
+        .unwrap();
+        r
+    }
+
+    #[tokio::test]
+    async fn an_mcp_client_signs_in_with_github() {
+        let r = connected_rig().await;
+        // It finds its way from a bare 401.
+        let res = r.http.post(format!("{}/mcp", r.url)).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let found = res.headers()[header::WWW_AUTHENTICATE].to_str().unwrap();
+        assert!(
+            found.contains("/.well-known/oauth-protected-resource"),
+            "{found}"
+        );
+        let meta: Value = r
+            .http
+            .get(format!("{}/.well-known/oauth-authorization-server", r.url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(meta["code_challenge_methods_supported"][0], "S256");
+
+        let c = r.register().await;
+        let cookie = r.consent(&c, "plain").await;
+        let shown: Value = r
+            .http
+            .get(format!("{}/oauth/request", r.url))
+            .header(header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(shown["who"], "github/plain");
+        assert_eq!(shown["client"], "Claude");
+        assert_eq!(shown["local"], true);
+        assert_eq!(shown["admin"], false);
+
+        // It acts with that person's roles, on /mcp alone.
+        let (access, _) = r.connect(&c, "plain").await;
+        assert_eq!(r.fleets(&access).await, ["line-07"]);
+        let elsewhere = r
+            .http
+            .get(format!("{}/v1/session", r.url))
+            .bearer_auth(&access)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(elsewhere.status(), StatusCode::UNAUTHORIZED);
+
+        // An owner's connection sees every fleet.
+        let (access, _) = r.connect(&c, "owner").await;
+        assert_eq!(r.fleets(&access).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_code_works_once_and_only_for_who_asked() {
+        let r = connected_rig().await;
+        let c = r.register().await;
+        let code = r.code(&c, "plain").await;
+        let (status, t) = r.trade(&c, &code, "the-wrong-verifier").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{t}");
+        assert_eq!(t["error"], "invalid_grant");
+        // The failed try spent it.
+        assert_eq!(
+            r.trade(&c, &code, VERIFIER).await.0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let code = r.code(&c, "plain").await;
+        let other = r.register().await;
+        assert_eq!(
+            r.trade(&other, &code, VERIFIER).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_happens_without_a_yes() {
+        let r = connected_rig().await;
+        let c = r.register().await;
+        // No cookie, no decision: another site can't answer for someone.
+        let forged = r
+            .http
+            .post(format!("{}/oauth/decide", r.url))
+            .json(&json!({ "request": "x", "allow": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forged.status(), StatusCode::NOT_FOUND);
+        let cookie = r.consent(&c, "plain").await;
+        let cross = r
+            .http
+            .post(format!("{}/oauth/decide", r.url))
+            .header(header::COOKIE, &cookie)
+            .header(header::ORIGIN, "https://evil.example")
+            .json(&json!({ "request": db::hash(cookie.split('=').nth(1).unwrap()), "allow": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cross.status(), StatusCode::FORBIDDEN);
+        // A page still showing an earlier request can't answer this one.
+        let stale = r
+            .http
+            .post(format!("{}/oauth/decide", r.url))
+            .header(header::COOKIE, &cookie)
+            .json(&json!({ "request": db::hash("the-one-on-screen"), "allow": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let v: Value = r.decide(&cookie, false).await.json().await.unwrap();
+        assert!(
+            v["redirect"]
+                .as_str()
+                .unwrap()
+                .contains("error=access_denied"),
+            "{v}"
+        );
+        assert_eq!(
+            r.decide(&cookie, true).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn the_consent_id_is_not_the_one_the_client_started() {
+        let r = connected_rig().await;
+        let c = r.register().await;
+        let cookie = r.consent(&c, "plain").await;
+        let id = cookie.split('=').nth(1).unwrap();
+        assert!(r.state.db.oauth_pending(id).unwrap().is_some());
+        assert!(
+            r.state
+                .db
+                .oauth_identified(id, &Caller::admin("x"), b"")
+                .unwrap()
+                .is_none(),
+            "the consent id is no GitHub state"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_checked_before_it_is_followed() {
+        let r = connected_rig().await;
+        let bad = r
+            .http
+            .post(format!("{}/register", r.url))
+            .json(&json!({ "redirect_uris": ["http://evil.example/cb"] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let c = r.register().await;
+        let res = r
+            .http
+            .get(format!(
+                "{}/authorize?response_type=code&client_id={}\
+                 &redirect_uri={}&code_challenge={CHALLENGE}&code_challenge_method=S256",
+                r.url,
+                c.id,
+                encode("https://evil.example/cb"),
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(c.redirect, "http://localhost:4000/cb");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_token_works_once_and_asks_github_again() {
+        let r = connected_rig().await;
+        let c = r.register().await;
+        let (old_access, refresh) = r.connect(&c, "plain").await;
+        let (status, t) = r.refresh(&c, &refresh).await;
+        assert_eq!(status, StatusCode::OK, "{t}");
+        let (access, next) = (
+            t["access_token"].as_str().unwrap(),
+            t["refresh_token"].as_str().unwrap(),
+        );
+        assert_ne!(next, refresh);
+        assert_eq!(r.fleets(access).await, ["line-07"]);
+
+        // Spent twice means copied: the whole connection ends.
+        assert_eq!(r.refresh(&c, &refresh).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(r.refresh(&c, next).await.0, StatusCode::BAD_REQUEST);
+        for dead in [access, old_access.as_str()] {
+            assert_eq!(
+                r.mcp(dead, "tools/list", json!({})).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        // Even several rotations back.
+        let (_, r0) = r.connect(&c, "plain").await;
+        let (_, t) = r.refresh(&c, &r0).await;
+        let r1 = t["refresh_token"].as_str().unwrap().to_string();
+        let (_, t) = r.refresh(&c, &r1).await;
+        let r2 = t["refresh_token"].as_str().unwrap().to_string();
+        assert_eq!(r.refresh(&c, &r0).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(r.refresh(&c, &r2).await.0, StatusCode::BAD_REQUEST);
+
+        // An admin can end one.
+        let (access, _) = r.connect(&c, "plain").await;
+        let all = r.state.db.oauth_connections().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].who, "github/plain");
+        assert!(r.state.db.oauth_delete_grant(all[0].id).unwrap());
+        assert_eq!(
+            r.mcp(&access, "tools/list", json!({})).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Removed from the organisation: out at the next refresh.
+        let (_, refresh) = r.connect(&c, "plain").await;
+        r.gh.removed.lock().unwrap().push("plain".into());
+        let (status, t) = r.refresh(&c, &refresh).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{t}");
+        assert_eq!(t["error"], "invalid_grant");
     }
 
     #[tokio::test]

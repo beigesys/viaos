@@ -79,7 +79,11 @@ export async function signOut() {
 
 export type Device = {
   id: string;
+  /** Its slug. */
   name: string;
+  /** What people call it; empty means use the slug. */
+  title: string;
+  note: string;
   fleet: string;
   arch: string | null;
   os_version: string | null;
@@ -118,7 +122,20 @@ export type Metrics = {
 };
 
 /** `access` is the caller's role on it. */
-export type Fleet = { name: string; parent: string | null; tags: string[]; devices: number; access: Level };
+export type Fleet = { name: string; title: string; note: string; parent: string | null; tags: string[]; devices: number; access: Level };
+
+/** What to call a fleet or device: its title, or its slug without one. */
+export const called = (x: { name: string; title?: string } | undefined, fallback = "") => x?.title || x?.name || fallback;
+
+/** The server's slug rule: lowercase letters, digits and single dashes. */
+export function slug(from: string): string {
+  return from
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+/, "")
+    .slice(0, 63)
+    .replace(/-+$/, "");
+}
 
 /** A fleet and those above it, outermost first. */
 export function lineage(fleets: Fleet[], name: string): string[] {

@@ -7,6 +7,7 @@ import { useFleets } from "./fleet";
 
 type Token = { name: string; role: string; created_at: number; last_used: number | null };
 type Grant = { subject: string; fleet: string | null; level: Level };
+type Connection = { id: number; who: string; client: string | null; connected_at: number };
 type Kind = "github" | "github-team" | "github-org" | "token";
 
 const ROLES: { value: Level; label: string; detail: string }[] = [
@@ -37,6 +38,14 @@ export function Access() {
   const grants = useQuery({
     queryKey: ["grants"],
     queryFn: () => tool<{ grants: Grant[] }>("list_grants").then((r) => r.grants),
+  });
+  const connections = useQuery({
+    queryKey: ["connections"],
+    queryFn: () => tool<{ connections: Connection[] }>("list_connections").then((r) => r.connections),
+  });
+  const disconnect = useMutation({
+    mutationFn: (id: number) => tool("revoke_connection", { id }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["connections"] }),
   });
   const changed = () => {
     qc.invalidateQueries({ queryKey: ["tokens"] });
@@ -133,6 +142,23 @@ export function Access() {
               </div>
             ))}
           </Section>
+
+          {options.data?.github && (
+            <Section title="Connected clients">
+              <Failure error={connections.error ?? disconnect.error} />
+              {connections.data?.length === 0 && <Empty title="No clients connected.">Claude connects to {server}/mcp and signs in with GitHub.</Empty>}
+              {connections.data?.map((c) => (
+                <div key={c.id} className="row grid grid-cols-[minmax(0,1fr)_8rem_auto] items-center gap-x-4 text-sm sm:grid-cols-[minmax(0,1fr)_minmax(0,12rem)_9rem_auto]">
+                  <span className="truncate font-medium">{c.who}</span>
+                  <span className="truncate font-mono text-xs text-ink-2">{c.client ?? "unnamed client"}</span>
+                  <span className="font-mono text-xs text-ink-3 max-sm:hidden">since {ago(c.connected_at)}</span>
+                  <Button tone="quiet" size="sm" className="hover:text-bad" disabled={disconnect.isPending} onClick={() => disconnect.mutate(c.id)}>
+                    Revoke
+                  </Button>
+                </div>
+              ))}
+            </Section>
+          )}
         </div>
 
         <div>

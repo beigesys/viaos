@@ -61,7 +61,7 @@ A device without a control plane is still fully manageable:
 | `crates/via-server` | Control plane: registry, enrollment, provisioning images, OS updates, fleet MCP |
 | `web/` | The web console: Bun, React, Tailwind. `nix/web.nix` builds it into `via-server` |
 | `crates/via-link` | Byte streams multiplexed over the device's one WebSocket |
-| `crates/via-cli` | `via` on the operator's machine: flash SD cards, release apps and OS versions (signed, and for Secure Boot), `ssh` and `forward` into devices |
+| `crates/via-cli` | `via` on the operator's machine: flash SD cards, release apps and OS versions (optionally signed, and for Secure Boot), `ssh` and `forward` into devices |
 | `crates/via-image` | The boot partition of a raw image, opened in place |
 | `crates/via-{core,compose,bundle,runtime,deploy}` | App releases, from [beigesys/via](https://github.com/beigesys/via) |
 

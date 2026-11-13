@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { ago, gb, tool } from "../lib";
+import { ago, gb, slug, tool } from "../lib";
 import { Button, buttonClass, Combobox, Copy, Empty, Failure, Field, Input, Notice, Section, Textarea } from "../ui";
 import { useCan } from "./fleet";
 
@@ -46,7 +46,7 @@ export function EnrollTab({ fleet }: { fleet: string }) {
       tool<Image>("create_provisioning_image", {
         fleet,
         device_type: chosen?.id,
-        ...(hostname.trim() ? { hostname: hostname.trim() } : {}),
+        ...(hostname.trim() ? { title: hostname.trim() } : {}),
         ssh_keys: keys.split("\n").map((k) => k.trim()).filter(Boolean),
       }),
     onSuccess: () => {
@@ -76,8 +76,8 @@ export function EnrollTab({ fleet }: { fleet: string }) {
                 options={types.map((t) => ({ value: t.id, label: t.name, detail: t.detail, group: t.arch, badge: t.ready ? undefined : "no image" }))}
               />
             </Field>
-            <Field label="Name" hint="Optional. The device keeps the name it reports otherwise.">
-              <Input value={hostname} onChange={(e) => setHostname(e.target.value)} placeholder="line-07" />
+            <Field label="Name" hint={slug(hostname) ? <>Hostname and slug <span className="font-mono">{slug(hostname)}</span></> : "Optional. The device keeps the hostname it reports otherwise."}>
+              <Input value={hostname} onChange={(e) => setHostname(e.target.value)} placeholder="Packing scale" maxLength={100} />
             </Field>
             <Field label="SSH keys" hint="Optional, one per line. Allowed to log in as root.">
               <Textarea value={keys} onChange={(e) => setKeys(e.target.value)} rows={2} placeholder="ssh-ed25519 AAAA…" />

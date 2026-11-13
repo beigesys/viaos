@@ -1,10 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { ago, byVersionDesc, duration, gb, lineage, tool, type Health, type MetricSample, type Metrics, type OsUpdate, type OsVersion } from "../lib";
+import { ago, byVersionDesc, called, duration, gb, lineage, tool, type Health, type MetricSample, type Metrics, type OsUpdate, type OsVersion } from "../lib";
 import { Terminal } from "../terminal";
 import { Button, Checkbox, Combobox, Failure, Headline, Input, Notice, Pip, Section } from "../ui";
-import { devicePath, fleetTrail, TagEditor, useCan, useDevices, useFleets } from "./fleet";
+import { devicePath, fleetTrail, NameAndNote, TagEditor, useCan, useDevices, useFleets } from "./fleet";
 import { ScopeVariables } from "./variables";
 import { Deployables, RunDialog, type Run } from "./releases";
 
@@ -397,11 +397,15 @@ export function DevicePage() {
     mutationFn: (tags: string[]) => tool("update_device", { device: name, tags }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["devices"] }),
   });
+  const naming = useMutation({
+    mutationFn: (change: { title?: string; note?: string }) => tool("update_device", { device: name, ...change }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["devices"] }),
+  });
   const latest = history[history.length - 1];
   const titles: Record<Tab, string> = { status: "", services: container ?? "Service", logs: "Logs", terminal: "Terminal", journal: "Journal", releases: "Releases", variables: "Variables" };
   const title = titles[tab];
   const fleets = useFleets();
-  const trail: [string, string][] = [...fleetTrail(fleets.data, fleet, true), ...(title ? ([[name, base]] as [string, string][]) : [])];
+  const trail: [string, string][] = [...fleetTrail(fleets.data, fleet, true), ...(title ? ([[called(device, name), base]] as [string, string][]) : [])];
 
   if (devices.isSuccess && !device) {
     return (
@@ -427,7 +431,7 @@ export function DevicePage() {
           </p>
         }
       >
-        {title || name}
+        {title || called(device, name)}
       </Headline>
       {device?.os_update && <OsUpdateProgress update={device.os_update} />}
 
@@ -519,6 +523,7 @@ export function DevicePage() {
               )}
               {developer && <OsUpdate device={name} arch={device?.arch} current={device?.os_version} disabled={!online} />}
             </Section>
+            {device && <NameAndNote key={device.id} slug={device.name} title={device.title} note={device.note} readOnly={!operator} pending={naming.isPending} error={naming.error} onSave={(c) => naming.mutate(c)} />}
             <TagEditor tags={device?.tags ?? []} inherited={device?.inherited_tags} known={(devices.data ?? []).flatMap((d) => d.tags)} pending={tagging.isPending} readOnly={!operator} onChange={(tags) => tagging.mutate(tags)} />
             <Failure error={tagging.error} />
             {metrics && <Storage m={metrics} />}

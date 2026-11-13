@@ -20,7 +20,7 @@ These are the acceptance tests. A tool exists because one of these needs it.
 | Server | Where | Tools |
 | --- | --- | --- |
 | device | `via-agent mcp` on the device (stdio) | `device_health`, `logs`, `journal`, `exec`, `os_update`, `deploy`, `sync_env` |
-| fleet | `via-server` at `/mcp` (HTTP, API token) | `list_fleets`, `device_metrics`, `create_fleet`, `update_fleet`, `update_device`, `delete_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `exec`, `list_os_versions`, `update_os`, `list_releases`, `release_details`, `release_contents`, `os_version_details`, `deploy`, `create_provisioning_image`, `list_provisioning_images`, `list_variables`, `set_variable`, `update_variables`, `delete_variable`, `set_device_type`, `delete_device_type`, `audit_log`, `list_tokens`, `create_token`, `revoke_token`, `list_grants`, `set_grant`, `delete_grant` |
+| fleet | `via-server` at `/mcp` (HTTP, API token or GitHub sign-in) | `list_fleets`, `device_metrics`, `create_fleet`, `update_fleet`, `update_device`, `delete_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `exec`, `list_os_versions`, `update_os`, `list_releases`, `release_details`, `release_contents`, `os_version_details`, `deploy`, `create_provisioning_image`, `list_provisioning_images`, `list_variables`, `set_variable`, `update_variables`, `delete_variable`, `set_device_type`, `delete_device_type`, `audit_log`, `list_tokens`, `create_token`, `revoke_token`, `list_connections`, `revoke_connection`, `list_grants`, `set_grant`, `delete_grant` |
 | local | `via mcp` on the operator's machine (stdio, root) | `list_disks`, `flash_image`, `flash_status`, `release_app` |
 
 The fleet server forwards device tools over each device's outbound
@@ -31,7 +31,8 @@ through the control plane as over `ssh device via-agent mcp`.
 
 `set_variable` and `delete_variable` take the `app` and `key`, exactly one of
 `fleet` or `device`, and optionally a `service`; without one, the value is for
-every service that declares the name. `set_variable` also takes `value` and
+every service that declares the name. Without `app` it is for every app (and
+can't name a service), stored with `app` as `""`. `set_variable` also takes `value` and
 `secret`. It adds a `warning` to its result when the app's newest release doesn't
 give that name to that service. Each value is stored separately, so deleting the
 one for a service leaves the rest.
