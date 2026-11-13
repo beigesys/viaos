@@ -513,7 +513,9 @@ impl Fleet {
         }))
     }
 
-    /// Every targeted device, with what will happen to it and why.
+    /// Every targeted device, with what will happen to it and why. A device
+    /// gets only builds of the variant it runs: the NVIDIA one never the plain
+    /// one, nor the other way round.
     async fn update_os(&self, a: &UpdateOsArgs) -> anyhow::Result<Value> {
         let s = &self.state;
         let devices = self.targets(&a.fleet, &a.device)?;
@@ -526,17 +528,17 @@ impl Fleet {
                     if d.os_version.as_deref() == Some(a.version.as_str()) {
                         return Some("already on this version".to_string());
                     }
-                    crate::os::find(&s.os_dir, d.arch.as_deref().unwrap_or_default(), &a.version)
+                    crate::os::find(&s.os_dir, &os_platform(d), &a.version)
                         .err()
                         .map(|e| format!("{e:#}"))
                 },
                 |d| {
-                    let arch = d.arch.clone().unwrap_or_default();
+                    let platform = os_platform(d);
                     let mut args = JsonObject::new();
                     args.insert("version".into(), json!(a.version));
                     args.insert(
                         "source".into(),
-                        json!(format!("{}/v1/os/{arch}/{}", s.public_url, a.version)),
+                        json!(format!("{}/v1/os/{platform}/{}", s.public_url, a.version)),
                     );
                     ("os_update", args)
                 },
@@ -1364,9 +1366,10 @@ impl Fleet {
 
     #[tool(
         name = "list_os_versions",
-        description = "OS versions the control plane can install, per architecture, with \
-                       download size. Compare with each device's os_version from \
-                       `list_devices`. Reads only.",
+        description = "OS versions the control plane can install, per architecture and \
+                       variant (e.g. `nvidia`; none is the plain OS), with download size. \
+                       Compare with each device's os_version and variant from `list_devices`: \
+                       a device installs only builds of its own variant. Reads only.",
         annotations(
             title = "List OS versions",
             read_only_hint = true,
@@ -2058,6 +2061,11 @@ fn inherited(fleets: &[crate::db::Fleet], fleet: &str) -> Vec<String> {
         at = found.and_then(|f| f.parent.as_deref());
     }
     tags
+}
+
+/// The OS builds a device takes updates from; see [`crate::os::platform`].
+fn os_platform(d: &crate::db::Device) -> String {
+    crate::os::platform(d.arch.as_deref().unwrap_or_default(), &d.variant)
 }
 
 #[cfg(test)]

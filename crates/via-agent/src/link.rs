@@ -141,6 +141,11 @@ async fn session(identity: &Identity, device: &Device) -> Result<()> {
     );
     if let Some(v) = os_version() {
         url += &format!("&os_version={v}");
+        // Which line of OS updates is this device's; see os::current_variant.
+        let variant = crate::os::current_variant();
+        if !variant.is_empty() {
+            url += &format!("&variant={variant}");
+        }
     }
     let mut req = url.into_client_request()?;
     req.headers_mut().insert(

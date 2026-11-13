@@ -157,7 +157,8 @@ export type Release = {
   artifacts: { arch: string; sha256: string; size_mb: number }[];
 };
 
-export type OsVersion = { arch: string; version: string; files: string[]; size_mb: number };
+/** `variant` (e.g. `nvidia`) is absent for the plain OS. */
+export type OsVersion = { arch: string; variant?: string; version: string; files: string[]; size_mb: number };
 
 export type Variable = {
   app: string;

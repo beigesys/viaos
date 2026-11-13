@@ -259,6 +259,7 @@ mod tests {
             fleet: "lab".into(),
             arch: None,
             os_version: None,
+            variant: String::new(),
             agent_version: None,
             enrolled_at: 0,
             last_seen: None,

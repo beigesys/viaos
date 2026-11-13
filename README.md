@@ -57,6 +57,7 @@ A device without a control plane is still fully manageable:
 | `nix/firmware.nix` | The firmware shipped: common Ethernet, Wi-Fi and Bluetooth chips; `viaos.firmware` adds more |
 | `nix/server-module.nix` | `services.via-server` for NixOS, with Caddy for TLS; `nix/server-test.nix` boots it in a VM |
 | `nix/rpi.nix` | Raspberry Pi 4 / 400 / CM4 boot chain (firmware → U-Boot → systemd-boot) |
+| `nix/nvidia.nix` | The NVIDIA variant (`images.x86_64-nvidia`): driver, and GPUs for containers via CDI |
 | `crates/via-agent` | Device daemon: applies `viaos.toml`, holds the control-plane link, serves device MCP |
 | `crates/via-server` | Control plane: registry, enrollment, provisioning images, OS updates, fleet MCP |
 | `web/` | The web console: Bun, React, Tailwind. `nix/web.nix` builds it into `via-server` |

@@ -1,9 +1,12 @@
 # Push a tag `v<N>` where N is the number in VERSION: builds both
-# architectures and attaches them to the GitHub release for that tag:
+# architectures, and the NVIDIA variant of x86_64, and attaches them to the
+# GitHub release for that tag:
 #
 #   viaos-<arch>.raw.zst     the base image provisioning images are made from;
 #                            every control plane fetches it when it has none
+#   viaos-pc-nvidia.raw.zst  the same for the `pc-nvidia` device type
 #   viaos-update-<arch>.tar  the OS update, for `via os-release`
+#                            (`x86_64-nvidia` for the variant)
 #
 # Images are plain: nothing is signed unless keys are given. Optional
 # repository secrets:
@@ -26,11 +29,17 @@ jobs:
   build:
     strategy:
       matrix:
+        # `base`: what the base image is for, a device type or an architecture.
         include:
           - arch: x86_64
+            base: x86_64
             runner: ubuntu-latest
           - arch: aarch64
+            base: aarch64
             runner: ubuntu-24.04-arm
+          - arch: x86_64-nvidia
+            base: pc-nvidia
+            runner: ubuntu-latest
     runs-on: ${{ matrix.runner }}
     # Here, not on the step, so the step's `if` can see whether it's set.
     env:
@@ -67,7 +76,7 @@ jobs:
       - name: Release files
         run: |
           mkdir out
-          zstd -T0 -6 "image/viaos_$(cat VERSION).raw" -o out/viaos-${{ matrix.arch }}.raw.zst
+          zstd -T0 -6 "image/viaos_$(cat VERSION).raw" -o out/viaos-${{ matrix.base }}.raw.zst
           tar -C update -chf out/viaos-update-${{ matrix.arch }}.tar .
           ls -la out
       - name: Attach to the release
@@ -82,6 +91,6 @@ jobs:
         if: env.VIA_SERVER != ''
         run: |
           via/bin/via os-release update
-          via/bin/via base-image "image/viaos_$(cat VERSION).raw" --arch ${{ matrix.arch }}
+          via/bin/via base-image "image/viaos_$(cat VERSION).raw" --device-type ${{ matrix.base }}
       - if: always()
         run: rm -rf "$RUNNER_TEMP/key" "$RUNNER_TEMP/sb"

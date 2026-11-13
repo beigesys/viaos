@@ -317,6 +317,10 @@ pub struct Device {
     pub fleet: String,
     pub arch: Option<String>,
     pub os_version: Option<String>,
+    /// Which build of viaos it runs, e.g. `nvidia`; empty for the plain one.
+    /// OS updates come only from builds of the same variant.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub variant: String,
     pub agent_version: Option<String>,
     pub enrolled_at: i64,
     pub last_seen: Option<i64>,
@@ -373,6 +377,7 @@ impl Db {
             ("fleets", "note"),
             ("devices", "title"),
             ("devices", "note"),
+            ("devices", "variant"),
             ("enrollment_tokens", "title"),
         ] {
             let has = conn
@@ -384,17 +389,7 @@ impl Db {
                 ))?;
             }
         }
-        // What a new server can image from the OS builds in this repository.
-        // The arm64 image carries both Pi firmware and a UEFI loader.
-        let types: i64 = conn.query_row("SELECT count(*) FROM device_types", [], |r| r.get(0))?;
-        if types == 0 {
-            conn.execute_batch(
-                "INSERT INTO device_types (id, name, arch, detail) VALUES
-                 ('pc', 'PC', 'x86_64', 'Industrial boxes, NUCs, anything with UEFI'),
-                 ('raspberry-pi', 'Raspberry Pi', 'aarch64', 'Pi 4, 400, CM4'),
-                 ('arm64-uefi', 'Generic ARM64', 'aarch64', 'Boards and VMs with UEFI firmware');",
-            )?;
-        }
+        seed_device_types(&conn)?;
         // Added after the first release of the schema.
         let has_actor: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('audit') WHERE name = 'actor'")?
@@ -849,6 +844,16 @@ impl Db {
                     agent_version = COALESCE(?4, agent_version)
              WHERE id = ?1",
             params![id, now(), os_version, agent_version],
+        )?;
+        Ok(())
+    }
+
+    /// Record the variant a device said it runs as it connected.
+    pub fn set_variant(&self, id: &str, variant: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE devices SET variant = ?2 WHERE id = ?1",
+            params![id, variant],
         )?;
         Ok(())
     }
@@ -1542,7 +1547,7 @@ const DEVICE_SELECT: &str = "
     SELECT d.id, d.name, f.name, d.arch, d.os_version, d.agent_version, d.enrolled_at, d.last_seen,
            (SELECT group_concat(tag, char(10)) FROM
               (SELECT tag FROM device_tags WHERE device_id = d.id ORDER BY tag)),
-           d.note, d.title
+           d.note, d.title, d.variant
     FROM devices d JOIN fleets f ON f.id = d.fleet_id";
 
 /// A tag is `key` or `key=value`, on a fleet or a device. The key is a plain
@@ -1667,6 +1672,61 @@ fn check_note(note: &str) -> Result<&str> {
     Ok(note)
 }
 
+/// What a server can image from the OS builds in this repository. The arm64
+/// image carries both Pi firmware and a UEFI loader.
+const DEVICE_TYPE_SEEDS: &[[&str; 4]] = &[
+    [
+        "pc",
+        "PC",
+        "x86_64",
+        "Industrial boxes, NUCs, anything with UEFI",
+    ],
+    ["raspberry-pi", "Raspberry Pi", "aarch64", "Pi 4, 400, CM4"],
+    [
+        "arm64-uefi",
+        "Generic ARM64",
+        "aarch64",
+        "Boards and VMs with UEFI firmware",
+    ],
+    [
+        "pc-nvidia",
+        "PC with NVIDIA GPU",
+        "x86_64",
+        "GTX 16xx, RTX 20xx and newer; containers get the GPU",
+    ],
+];
+
+/// Offer each seeded device type once, new servers and old alike, so a type
+/// added in a later version shows up on a running server; one an admin
+/// deleted stays deleted.
+fn seed_device_types(conn: &Connection) -> Result<()> {
+    let tracked = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'device_type_seeds'")?
+        .exists([])?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS device_type_seeds (id TEXT PRIMARY KEY)")?;
+    let types: i64 = conn.query_row("SELECT count(*) FROM device_types", [], |r| r.get(0))?;
+    if !tracked && types > 0 {
+        // A server from before seeds were tracked was offered the first
+        // three when it started.
+        conn.execute_batch(
+            "INSERT INTO device_type_seeds (id) VALUES ('pc'), ('raspberry-pi'), ('arm64-uefi')",
+        )?;
+    }
+    for [id, name, arch, detail] in DEVICE_TYPE_SEEDS {
+        if conn.execute(
+            "INSERT OR IGNORE INTO device_type_seeds (id) VALUES (?1)",
+            [id],
+        )? == 1
+        {
+            conn.execute(
+                "INSERT OR IGNORE INTO device_types (id, name, arch, detail) VALUES (?1, ?2, ?3, ?4)",
+                [id, name, arch, detail],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn device_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
     Ok(Device {
         id: r.get(0)?,
@@ -1683,6 +1743,7 @@ fn device_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
             .unwrap_or_default(),
         note: r.get(9)?,
         title: r.get(10)?,
+        variant: r.get(11)?,
     })
 }
 
@@ -2024,7 +2085,7 @@ mod tests {
     #[test]
     fn device_types_can_be_added_and_seeds_stay_removed() {
         let (d, db) = db();
-        assert_eq!(db.device_types().unwrap().len(), 3);
+        assert_eq!(db.device_types().unwrap().len(), 4);
         let t = DeviceType {
             id: "rock-5b".into(),
             name: "Rock 5B".into(),
@@ -2044,6 +2105,39 @@ mod tests {
         drop(db);
         let db = Db::open(&d.path().join("via.db")).unwrap();
         assert!(!db.device_types().unwrap().iter().any(|t| t.id == "pc"));
+    }
+
+    #[test]
+    fn a_running_server_gains_new_seeds_once() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("via.db");
+        // A server from before seeds were tracked, whose admin removed `pc`.
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            c.execute_batch(
+                "INSERT INTO device_types (id, name, arch) VALUES
+                 ('raspberry-pi', 'Raspberry Pi', 'aarch64'),
+                 ('rock-5b', 'Rock 5B', 'aarch64');",
+            )
+            .unwrap();
+        }
+        let ids = |db: &Db| -> Vec<String> {
+            let mut v: Vec<String> = db
+                .device_types()
+                .unwrap()
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+            v.sort();
+            v
+        };
+        let db = Db::open(&path).unwrap();
+        assert_eq!(ids(&db), ["pc-nvidia", "raspberry-pi", "rock-5b"]);
+        db.delete_device_type("pc-nvidia").unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(ids(&db), ["raspberry-pi", "rock-5b"]);
     }
 
     #[test]

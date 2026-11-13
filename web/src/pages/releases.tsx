@@ -143,7 +143,7 @@ export function Deployables({ target, base, label, running = [], runningOs = [],
                 version {version}
               </Link>
               <span className="flex items-center gap-2 max-sm:col-span-2 max-sm:row-start-2">{runningOs.includes(version) && <Badge tone="running">running</Badge>}{i === 0 && <Badge tone="latest">latest</Badge>}</span>
-              <span className="truncate font-mono text-xs text-ink-3 max-sm:col-span-2 max-sm:row-start-3">{vs.map((v) => `${v.arch} ${gb(v.size_mb)}`).join(", ")}</span>
+              <span className="truncate font-mono text-xs text-ink-3 max-sm:col-span-2 max-sm:row-start-3">{vs.map((v) => `${v.arch}${v.variant ? `-${v.variant}` : ""} ${gb(v.size_mb)}`).join(", ")}</span>
               {admin && (
                 <Button
                   size="sm"

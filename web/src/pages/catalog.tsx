@@ -482,7 +482,7 @@ export function OsPage() {
   );
 }
 
-type OsDetails = { builds: { arch: string; published_at: number; size_mb: number; files: { name: string; size_mb: number; sha256: string | null }[] }[] };
+type OsDetails = { builds: { arch: string; variant?: string; published_at: number; size_mb: number; files: { name: string; size_mb: number; sha256: string | null }[] }[] };
 
 export function OsVersionPage() {
   const { version = "", fleet } = useParams();
@@ -498,7 +498,7 @@ export function OsVersionPage() {
         <div className="grid gap-x-5 lg:grid-cols-[minmax(0,1fr)_22rem] lg:items-start">
           <div className="min-w-0">
             {q.data.builds.map((b) => (
-              <Section key={b.arch} title={b.arch} aside={<span className="label">{gb(b.size_mb)} · {ago(b.published_at)}</span>}>
+              <Section key={`${b.arch}-${b.variant}`} title={b.variant ? `${b.arch}-${b.variant}` : b.arch} aside={<span className="label">{gb(b.size_mb)} · {ago(b.published_at)}</span>}>
                 {b.files.map((f) => (
                   <div key={f.name} className="row block">
                     <div className="flex items-baseline justify-between gap-3 font-mono text-xs">

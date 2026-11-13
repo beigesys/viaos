@@ -15,19 +15,34 @@ use anyhow::{Context, Result, bail};
 /// The architectures images exist for, as `uname -m` spells them.
 pub const ARCHES: &[&str] = &["x86_64", "i686", "aarch64", "armv7l"];
 
+/// Device types that run a variant of viaos, not their architecture's plain
+/// OS. Only their own image will do: the plain one would boot, without what
+/// the type is for.
+const VARIANTS: &[&str] = &["pc-nvidia"];
+
+/// Whether a device type can make do with its architecture's image.
+pub fn shares_arch_image(t: &crate::db::DeviceType) -> bool {
+    !VARIANTS.contains(&t.id.as_str())
+}
+
 /// A device type's own base image, or else its architecture's.
 pub fn base_image(dir: &Path, t: &crate::db::DeviceType) -> Result<PathBuf> {
-    for name in [&t.id, &t.arch] {
+    let names = if shares_arch_image(t) {
+        vec![&t.id, &t.arch]
+    } else {
+        vec![&t.id]
+    };
+    for name in &names {
         let path = dir.join(format!("viaos-{name}.raw"));
         if path.exists() {
             return Ok(path);
         }
     }
+    let names: Vec<String> = names.iter().map(|n| format!("viaos-{n}.raw")).collect();
     bail!(
-        "no base image for {}: upload one with `via base-image`, as viaos-{}.raw or viaos-{}.raw",
+        "no base image for {}: upload one with `via base-image`, as {}",
         t.name,
-        t.id,
-        t.arch
+        names.join(" or ")
     );
 }
 
