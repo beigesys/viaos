@@ -95,7 +95,7 @@ export function Deployables({ target, base, label, running = [], runningOs = [],
     <>
       <Section title="Apps">
         <Failure error={releases.error} />
-        {releases.data?.length === 0 && <Empty title="No releases uploaded.">Build and upload one from a compose file with <code className="font-mono text-xs">via release -r 1</code>.</Empty>}
+        {releases.data?.length === 0 && <Empty title="No releases uploaded.">Build and upload one from a compose file with <code className="font-mono text-xs">via release</code>.</Empty>}
         {apps.flatMap(([app, rs]) =>
           [...rs].sort((a, b) => byVersionDesc(a.release, b.release)).map((r, i) => (
             <div key={`${app}/${r.release}`} className={rowClass}>

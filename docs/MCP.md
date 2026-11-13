@@ -14,13 +14,14 @@ These are the acceptance tests. A tool exists because one of these needs it.
 | "Update all of fleet X to version Y" (apps) | local `release_app`, then `list_releases`, `deploy` (dry_run first) | works, including rollback on a failed health gate |
 | "Provision the attached device" | `create_provisioning_image`, then local `list_disks`, `flash_image` | works; not yet tried on a real card |
 | "Make a provisioning image for a Pi and an x86 box on fleet X" | `create_provisioning_image` x2 | works: both enrolled into one fleet (Pi image booted in emulated arm64 UEFI; not yet on a real Pi) |
+| "Deploy every push to `via` in acme/web to fleet X" | `add_publisher`, `follow_app` | works against a fake GitHub; not yet from a real Actions run |
 
 ## Servers
 
 | Server | Where | Tools |
 | --- | --- | --- |
 | device | `via-agent mcp` on the device (stdio) | `device_health`, `logs`, `journal`, `exec`, `os_update`, `deploy`, `sync_env` |
-| fleet | `via-server` at `/mcp` (HTTP, API token or GitHub sign-in) | `list_fleets`, `device_metrics`, `create_fleet`, `update_fleet`, `update_device`, `delete_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `exec`, `list_os_versions`, `update_os`, `list_releases`, `release_details`, `release_contents`, `os_version_details`, `deploy`, `create_provisioning_image`, `list_provisioning_images`, `list_variables`, `set_variable`, `update_variables`, `delete_variable`, `set_device_type`, `delete_device_type`, `audit_log`, `list_tokens`, `create_token`, `revoke_token`, `list_connections`, `revoke_connection`, `list_grants`, `set_grant`, `delete_grant` |
+| fleet | `via-server` at `/mcp` (HTTP, API token or GitHub sign-in) | `list_fleets`, `device_metrics`, `create_fleet`, `update_fleet`, `update_device`, `delete_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `exec`, `list_os_versions`, `update_os`, `list_releases`, `release_details`, `release_contents`, `os_version_details`, `deploy`, `create_provisioning_image`, `list_provisioning_images`, `list_variables`, `set_variable`, `update_variables`, `delete_variable`, `set_device_type`, `delete_device_type`, `audit_log`, `list_tokens`, `create_token`, `revoke_token`, `list_connections`, `revoke_connection`, `list_grants`, `set_grant`, `delete_grant`, `list_publishers`, `add_publisher`, `remove_publisher`, `list_follows`, `follow_app` |
 | local | `via mcp` on the operator's machine (stdio, root) | `list_disks`, `flash_image`, `flash_status`, `release_app` |
 
 The fleet server forwards device tools over each device's outbound
@@ -60,6 +61,23 @@ out is removed. `list_variables` returns:
 null for a secret. `schemas` has each app's newest release, and its `variables`
 are what that release describes in `x-via` plus any bare `- KEY` it doesn't
 describe. [deploy.md](deploy.md#variables-and-secrets) has the precedence.
+
+## Publishing and following
+
+`add_publisher` (admin) takes `repository` (`owner/name`), `apps`, and
+optionally `refs` (default `refs/heads/via` and `refs/tags/v*`; `*` matches any
+run of characters) and `repository_id`. It replaces what an existing publisher
+may do, and returns the workflow file to add. `list_publishers` and
+`remove_publisher` are admin-only too. A run's OIDC token is good for
+`POST /v1/releases/{app}` and `PUT /v1/releases/{app}/{release}/{arch}` of the
+publisher's apps, and nothing else; it is audited as
+`github-actions:<owner/name>@<ref>`, and a refused one as `publish_refused`.
+
+`follow_app` takes `fleet`, `app` and `follow` (default true) and needs
+developer on the fleet. `list_follows` takes an optional `fleet`. Each deploy it
+starts is audited as `auto_deploy`, under the uploader's name, or under
+`auto-deploy` when a device catches up on reconnecting. An upload's reply
+lists them under `auto_deploy`.
 
 ## Rules
 

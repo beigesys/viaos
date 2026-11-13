@@ -101,7 +101,7 @@ export function AppsPage() {
       <Failure error={releases.error} />
       {releases.isSuccess && apps.length === 0 && (
         <div className="border border-rule bg-sheet px-3">
-          <Empty title="No apps yet.">Build and upload one from a compose file with <code className="font-mono text-xs">via release -r 1</code>.</Empty>
+          <Empty title="No apps yet.">Build and upload one from a compose file with <code className="font-mono text-xs">via release</code>.</Empty>
         </div>
       )}
       {apps.length > 0 && (

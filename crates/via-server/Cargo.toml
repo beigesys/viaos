@@ -13,6 +13,8 @@ chacha20poly1305.workspace = true
 axum = { workspace = true, features = ["ws"] }
 clap.workspace = true
 hex.workspace = true
+# GitHub Actions OIDC tokens. With aws-lc-rs, which rustls already brings in.
+jsonwebtoken = { version = "12", default-features = false, features = ["aws_lc_rs"] }
 rand.workspace = true
 reqwest.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-streamable-http-server"] }
@@ -33,5 +35,7 @@ via-image.workspace = true
 via-link.workspace = true
 
 [dev-dependencies]
+aws-lc-rs = "1"
 tar.workspace = true
 tempfile.workspace = true
+tokio-tungstenite.workspace = true
