@@ -23,6 +23,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["io"] }
+toml.workspace = true
 futures-util.workspace = true
 zstd = { workspace = true, features = ["zstdmt"] }
 tracing.workspace = true
@@ -33,5 +34,6 @@ via-image.workspace = true
 via-link.workspace = true
 
 [dev-dependencies]
+fatfs.workspace = true
 tar.workspace = true
 tempfile.workspace = true

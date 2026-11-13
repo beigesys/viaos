@@ -4,13 +4,13 @@
 //! writing the image. It is read on every start, so editing it and rebooting
 //! is the whole reconfiguration story.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Config {
     pub hostname: Option<String>,
     pub control: Option<Control>,
@@ -18,6 +18,14 @@ pub struct Config {
     pub ssh: Ssh,
     #[serde(default)]
     pub trust: Trust,
+    /// `[[wifi]]`, `[network]`, `[time]` and `[proxy]`; see system.rs.
+    #[serde(flatten)]
+    pub system: via_core::settings::Settings,
+    /// Sections this agent does not know, from a newer control plane or
+    /// a typo. Warned about rather than refused: an agent that will not
+    /// start cannot be reached to fix it.
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, toml::Value>,
 }
 
 /// Who the device takes OS updates and app releases from.
@@ -54,7 +62,12 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+                let cfg: Self =
+                    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+                for key in cfg.unknown.keys() {
+                    tracing::warn!("{}: ignoring unknown `{key}`", path.display());
+                }
+                Ok(cfg)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
@@ -160,5 +173,63 @@ mod tests {
         assert!(cfg.trust_policy().unwrap().requires_signature());
         let bad: Config = toml::from_str("[trust]\nkeys = [\"zz\"]\n").unwrap();
         assert!(bad.trust_policy().is_err());
+    }
+
+    #[test]
+    fn system_sections_parse() {
+        use via_core::settings::{Addressing, Interface};
+        let cfg: Config = toml::from_str(
+            r#"
+            hostname = "line-07"
+            [[wifi]]
+            ssid = "Plant Floor"
+            passphrase = "correct horse"
+            priority = 10
+            [[wifi]]
+            ssid = "guest"
+            hidden = true
+            [network]
+            mode = "static"
+            address = "192.168.10.20/24"
+            gateway = "192.168.10.1"
+            dns = ["192.168.10.1"]
+            interfaces = ["wired"]
+            [time]
+            timezone = "America/Chicago"
+            ntp = ["ntp.plant.lan"]
+            [proxy]
+            http = "http://proxy:3128"
+            https = "http://proxy:3128"
+            no_proxy = [".plant.lan"]
+            "#,
+        )
+        .unwrap();
+        let s = &cfg.system;
+        s.check().unwrap();
+        let wifi = s.wifi.as_ref().unwrap();
+        assert_eq!(wifi[0].priority, 10);
+        assert!(wifi[1].hidden && wifi[1].is_open());
+        let n = s.network.as_ref().unwrap();
+        assert_eq!(
+            (n.mode, n.links()),
+            (Addressing::Static, vec![Interface::Wired])
+        );
+        assert_eq!(
+            s.time.as_ref().unwrap().timezone.as_deref(),
+            Some("America/Chicago")
+        );
+        assert!(s.proxy.as_ref().unwrap().is_set());
+        assert!(cfg.unknown.is_empty());
+    }
+
+    #[test]
+    fn unknown_sections_are_tolerated() {
+        let cfg: Config =
+            toml::from_str("hostname = \"a\"\n[future]\nthing = 1\n[[wifi]]\nssid = \"x\"\n")
+                .unwrap();
+        assert_eq!(cfg.unknown.keys().collect::<Vec<_>>(), ["future"]);
+        assert_eq!(cfg.system.wifi.unwrap().len(), 1);
+        // A typo inside a known section is still an error.
+        assert!(toml::from_str::<Config>("[network]\nmdoe = \"static\"\n").is_err());
     }
 }

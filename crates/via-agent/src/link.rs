@@ -147,7 +147,22 @@ async fn session(identity: &Identity, device: &Device) -> Result<()> {
         "authorization",
         HeaderValue::from_str(&format!("Bearer {}", identity.credential))?,
     );
-    let (ws, _) = tokio_tungstenite::connect_async(req).await?;
+    let uri = req.uri().clone();
+    let host = uri.host().unwrap_or_default().to_string();
+    let (ws, _) = match crate::proxy::for_url(uri.scheme_str().unwrap_or("ws"), &host) {
+        Some(proxy) => {
+            let port = uri
+                .port_u16()
+                .unwrap_or(if uri.scheme_str() == Some("wss") {
+                    443
+                } else {
+                    80
+                });
+            let stream = crate::proxy::tunnel(&proxy, &host, port).await?;
+            tokio_tungstenite::client_async_tls(req, stream).await?
+        }
+        None => tokio_tungstenite::connect_async(req).await?,
+    };
     tracing::info!("connected to {}", identity.url);
     // What `via-agent ready` waits for: this boot reached the control plane.
     let _ = std::fs::create_dir_all(CONNECTED.rsplit_once('/').map_or("/run", |(d, _)| d));

@@ -20,6 +20,7 @@ mod error;
 mod id;
 mod platform;
 mod release;
+pub mod settings;
 
 pub use deployment::{
     DEPLOYMENT_SCHEMA_VERSION, Dependency, DependencyCondition, Deployment, HealthCheck,

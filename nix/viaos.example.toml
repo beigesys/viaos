@@ -11,3 +11,30 @@
 # Keys allowed to `ssh root@<device>`.
 # [ssh]
 # authorized_keys = ["ssh-ed25519 AAAA... you@laptop"]
+
+# Wi-Fi networks, highest priority tried first. Leave out passphrase for an
+# open network.
+# [[wifi]]
+# ssid = "Plant Floor"
+# passphrase = "..."
+# priority = 10
+# hidden = false
+
+# Addressing: DHCP unless set. interfaces is "wired" and/or "wifi"; both if
+# left out.
+# [network]
+# mode = "static"
+# address = "192.168.10.20/24"
+# gateway = "192.168.10.1"
+# dns = ["192.168.10.1"]
+# interfaces = ["wired"]
+
+# [time]
+# timezone = "America/Chicago"
+# ntp = ["ntp.plant.lan"]
+
+# For the agent, Docker's image pulls and app containers.
+# [proxy]
+# http = "http://proxy.plant.lan:3128"
+# https = "http://proxy.plant.lan:3128"
+# no_proxy = [".plant.lan", "10.0.0.0/8"]

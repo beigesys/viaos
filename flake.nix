@@ -87,6 +87,11 @@
         inherit self;
         pkgs = nixpkgs.legacyPackages.x86_64-linux;
       };
+      # viaos.toml's Wi-Fi, network, time and proxy settings on a booted system.
+      checks.x86_64-linux.settings = import ./nix/settings-test.nix {
+        inherit self;
+        pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      };
 
       nixosConfigurations = {
         viaos-x86_64 = mkViaos { system = "x86_64-linux"; };

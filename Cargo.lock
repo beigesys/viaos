@@ -2759,6 +2759,7 @@ name = "via-agent"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "futures",
  "hex",
@@ -2843,6 +2844,7 @@ name = "via-core"
 version = "0.0.1"
 dependencies = [
  "hex",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",
@@ -2910,6 +2912,7 @@ dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
  "clap",
+ "fatfs",
  "futures-util",
  "hex",
  "rand 0.10.3",
@@ -2924,6 +2927,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "via-bundle",

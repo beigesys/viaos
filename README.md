@@ -54,6 +54,7 @@ A device without a control plane is still fully manageable:
 | --- | --- |
 | `nix/viaos.nix` | The OS: verity-protected A/B `/nix/store`, tmpfs `/`, `/var` grown on first boot |
 | `nix/sysupdate.nix`, `nix/update.nix` | OS update files and how sysupdate installs them |
+| `nix/network.nix` | Wired and Wi-Fi (networkd, iwd), and viaos.toml's network, time and proxy settings applied at boot |
 | `nix/firmware.nix` | The firmware shipped: common Ethernet, Wi-Fi and Bluetooth chips; `viaos.firmware` adds more |
 | `nix/server-module.nix` | `services.via-server` for NixOS, with Caddy for TLS; `nix/server-test.nix` boots it in a VM |
 | `nix/rpi.nix` | Raspberry Pi 4 / 400 / CM4 boot chain (firmware → U-Boot → systemd-boot) |
@@ -69,7 +70,7 @@ The OS is about 1.1 GB installed. An OS update downloads about 610 MB, and
 the raw image is 4.7 GB (two 2 GB store slots), so it needs an 8 GB disk.
 
 `viaos.toml` on the boot partition configures a device (hostname, control
-plane, SSH keys); see `nix/viaos.example.toml`. `docs/MCP.md` lists the tools.
+plane, SSH keys, Wi-Fi, addressing, time zone, proxy); see `nix/viaos.example.toml`. `docs/MCP.md` lists the tools.
 
 ## Development
 

@@ -249,6 +249,40 @@ pub struct ProvisionArgs {
     /// SSH public keys allowed to log in as root.
     #[serde(default)]
     pub ssh_keys: Vec<String>,
+    /// Wi-Fi, addressing, time and proxy. A section left out comes from the
+    /// nearest fleet that sets one (`fleet_provisioning` shows them).
+    #[serde(default)]
+    pub settings: via_core::settings::Settings,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FleetArg {
+    pub fleet: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetFleetProvisioningArgs {
+    pub fleet: String,
+    /// The sections to set as this fleet's own; those left out stay as
+    /// they are. A Wi-Fi network listed without `passphrase` keeps the one
+    /// already stored for its SSID.
+    #[serde(default)]
+    pub settings: via_core::settings::Settings,
+    /// Sections to stop setting here, so they come from the fleet above:
+    /// any of `wifi`, `network`, `time`, `proxy`.
+    #[serde(default)]
+    pub inherit: Vec<String>,
+}
+
+/// What the audit log keeps of settings: which sections, and the Wi-Fi
+/// names, never a passphrase.
+fn settings_summary(s: &via_core::settings::Settings) -> Value {
+    json!({
+        "wifi": s.wifi.as_ref().map(|w| w.iter().map(|w| w.ssid.clone()).collect::<Vec<_>>()),
+        "network": s.network.is_some(),
+        "time": s.time.is_some(),
+        "proxy": s.proxy.is_some(),
+    })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -569,6 +603,19 @@ impl Fleet {
         }))
     }
 
+    /// A fleet's provisioning settings as the caller may see them: a fleet
+    /// above the ones they can see is named only as `above`.
+    fn provisioning_view(&self, fleet: &str) -> anyhow::Result<Value> {
+        let access = self.access()?;
+        let mut inherited = crate::provisioning::inherited(&self.state, fleet)?;
+        for from in inherited.from.values_mut() {
+            if !access.sees(from) {
+                *from = "above".into();
+            }
+        }
+        Ok(crate::provisioning::view(fleet, &inherited))
+    }
+
     fn provision(&self, a: &ProvisionArgs) -> anyhow::Result<Value> {
         let s = &self.state;
         let types = s.db.device_types()?;
@@ -593,6 +640,7 @@ impl Fleet {
                 crate::db::slug(&a.fleet)?
             );
         }
+        let settings = crate::provisioning::for_image(s, &a.fleet, &a.settings)?;
         s.db.create_fleet(&a.fleet)?;
         // The token goes into the image and nowhere else: not into this
         // result, the audit log, or the server's own log.
@@ -625,6 +673,11 @@ impl Fleet {
         if !s.trusted_keys.is_empty() {
             let keys: Vec<String> = s.trusted_keys.iter().map(|k| toml_str(k)).collect();
             toml += &format!("\n[trust]\nkeys = [{}]\n", keys.join(", "));
+        }
+        // Like the token, Wi-Fi passphrases go into the image and nowhere else.
+        let system = crate::provisioning::toml(&settings)?;
+        if !system.is_empty() {
+            toml += &format!("\n{system}");
         }
 
         let name = format!(
@@ -1981,6 +2034,7 @@ impl Fleet {
         // says what changed.
         let args = json!({
             "fleet": a.fleet, "device_type": a.device_type, "arch": a.arch, "hostname": a.hostname, "title": a.title, "ssh_keys": a.ssh_keys.len(),
+            "settings": settings_summary(&a.settings),
         });
         self.audited("create_provisioning_image", args, async {
             let this = self.clone();
@@ -1991,6 +2045,66 @@ impl Fleet {
             })
             .await??;
             Ok(rendered(v))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "fleet_provisioning",
+        description = "The Wi-Fi, network, time and proxy settings a new image for this \
+                       fleet starts with, each section from the nearest fleet up the tree \
+                       that sets it (`from`). Wi-Fi passphrases show only as \
+                       `has_passphrase`. Reads only.",
+        annotations(
+            title = "Fleet provisioning settings",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn fleet_provisioning(
+        &self,
+        Parameters(a): Parameters<FleetArg>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.audited("fleet_provisioning", json!({ "fleet": a.fleet }), async {
+            self.fleet_for(
+                &a.fleet,
+                Level::Developer,
+                "reading its provisioning settings",
+            )?;
+            Ok(rendered(self.provisioning_view(&a.fleet)?))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "set_fleet_provisioning",
+        description = "Set the Wi-Fi, network, time or proxy settings new images for this \
+                       fleet, and the fleets under it, start with. Devices already running \
+                       are unaffected. Never ask for a Wi-Fi passphrase in chat: send the \
+                       user to the web console's Enroll tab, or list the network without \
+                       one to keep the stored passphrase.",
+        annotations(
+            title = "Set fleet provisioning settings",
+            read_only_hint = false,
+            destructive_hint = false
+        )
+    )]
+    async fn set_fleet_provisioning(
+        &self,
+        Parameters(a): Parameters<SetFleetProvisioningArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let args = json!({
+            "fleet": a.fleet, "settings": settings_summary(&a.settings), "inherit": a.inherit,
+        });
+        self.audited("set_fleet_provisioning", args, async {
+            self.fleet_for(
+                &a.fleet,
+                Level::Developer,
+                "changing its provisioning settings",
+            )?;
+            let actor = CALLER.try_with(|c| c.name.clone()).unwrap_or_default();
+            crate::provisioning::set(&self.state, &a.fleet, &a.settings, &a.inherit, &actor)?;
+            Ok(rendered(self.provisioning_view(&a.fleet)?))
         })
         .await
     }
@@ -2499,5 +2613,141 @@ mod tests {
         let e = crate::developer_on(&r.state, &caller(&dev), "far", "a terminal").unwrap_err();
         assert_eq!(e.to_string(), "no device named \"far\"");
         crate::developer_on(&r.state, &caller(&dev), "press", "a terminal").unwrap();
+    }
+
+    const PASS: &str = "line-seven-wifi-pass";
+
+    /// A raw disk with a GPT and an empty FAT partition labelled `esp`: all
+    /// of a base image that provisioning touches.
+    fn tiny_base_image(path: &std::path::Path) {
+        const SECTOR: usize = 512;
+        let fat_sectors = 16 * 1024;
+        let mut fat = std::io::Cursor::new(vec![0u8; fat_sectors * SECTOR]);
+        fatfs::format_volume(&mut fat, fatfs::FormatVolumeOptions::new()).unwrap();
+        let mut disk = vec![0u8; 34 * SECTOR];
+        disk[SECTOR..SECTOR + 8].copy_from_slice(b"EFI PART");
+        disk[SECTOR + 72..SECTOR + 80].copy_from_slice(&2u64.to_le_bytes());
+        disk[SECTOR + 80..SECTOR + 84].copy_from_slice(&1u32.to_le_bytes());
+        disk[SECTOR + 84..SECTOR + 88].copy_from_slice(&128u32.to_le_bytes());
+        let entry = 2 * SECTOR;
+        disk[entry] = 1;
+        disk[entry + 32..entry + 40].copy_from_slice(&34u64.to_le_bytes());
+        let last = 34 + fat_sectors as u64 - 1;
+        disk[entry + 40..entry + 48].copy_from_slice(&last.to_le_bytes());
+        for (i, c) in "esp".encode_utf16().enumerate() {
+            disk[entry + 56 + 2 * i..entry + 58 + 2 * i].copy_from_slice(&c.to_le_bytes());
+        }
+        disk.extend_from_slice(fat.get_ref());
+        std::fs::write(path, disk).unwrap();
+    }
+
+    fn image_config(state: &crate::State, download: &str) -> String {
+        use std::io::Read;
+        let id = download.rsplit('/').next().unwrap();
+        let raw = state.data_dir.join("unpacked.raw");
+        crate::image::decompress(&state.out_dir().join(format!("{id}.raw.zst")), &raw).unwrap();
+        let fs = via_image::open_esp(&raw).unwrap();
+        let mut text = String::new();
+        fs.root_dir()
+            .open_file("viaos.toml")
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        text
+    }
+
+    #[tokio::test]
+    async fn fleet_defaults_reach_the_image_and_passphrases_nothing_else() {
+        let r = rig().await;
+        std::fs::create_dir_all(&r.state.images_dir).unwrap();
+        tiny_base_image(&r.state.images_dir.join("viaos-x86_64.raw"));
+        let east = r.token("east", Some(Level::Developer), Some("acme-east"));
+        let line = r.token("line", Some(Level::Developer), Some("line-07"));
+        let obs = r.token("obs", Some(Level::Observer), Some("acme-east"));
+        let admin = r.token("admin", None, None);
+
+        let set = json!({
+            "fleet": "acme-east",
+            "settings": {
+                "wifi": [{ "ssid": "Line 7", "passphrase": PASS, "priority": 2 }, { "ssid": "guest" }],
+                "time": { "timezone": "America/New_York", "ntp": ["ntp.acme.lan"] },
+                "proxy": { "https": "http://proxy.acme.lan:3128" },
+            },
+        });
+        let e = r.refused(&obs, "set_fleet_provisioning", set.clone()).await;
+        assert!(e.contains("is an observer on"), "{e}");
+        let e = r
+            .refused(&line, "set_fleet_provisioning", set.clone())
+            .await;
+        assert!(e.starts_with("no fleet named"), "{e}");
+        let shown = r.call(&east, "set_fleet_provisioning", set).await.unwrap();
+        assert_eq!(shown["settings"]["wifi"][0]["has_passphrase"], true);
+        assert_eq!(shown["settings"]["wifi"][1]["has_passphrase"], false);
+        assert!(!shown.to_string().contains(PASS));
+
+        // line-07 inherits it, without learning which fleet above set it.
+        let seen = r
+            .call(&line, "fleet_provisioning", json!({ "fleet": "line-07" }))
+            .await
+            .unwrap();
+        assert_eq!(seen["from"]["wifi"], "above");
+        assert_eq!(seen["settings"]["time"]["timezone"], "America/New_York");
+        assert!(!seen.to_string().contains(PASS));
+        let e = r
+            .refused(&obs, "fleet_provisioning", json!({ "fleet": "line-07" }))
+            .await;
+        assert!(e.contains("is an observer on"), "{e}");
+
+        // An image sets its own addressing and keeps the rest, passphrase
+        // included.
+        let made = r
+            .call(
+                &line,
+                "create_provisioning_image",
+                json!({
+                    "fleet": "line-07", "device_type": "pc", "title": "Scale",
+                    "settings": { "network": {
+                        "mode": "static", "address": "10.7.0.20/24", "gateway": "10.7.0.1",
+                        "interfaces": ["wired"],
+                    } },
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!made.to_string().contains(PASS));
+        let text = image_config(&r.state, made["download"].as_str().unwrap());
+        #[derive(serde::Deserialize)]
+        struct File {
+            #[serde(flatten)]
+            settings: via_core::settings::Settings,
+            #[serde(flatten)]
+            rest: std::collections::BTreeMap<String, toml::Value>,
+        }
+        let file: File = toml::from_str(&text).unwrap();
+        assert!(
+            file.rest.contains_key("control") && file.rest["hostname"].as_str() == Some("scale")
+        );
+        let s = file.settings;
+        let wifi = s.wifi.unwrap();
+        assert_eq!(wifi[0].passphrase.as_deref(), Some(PASS));
+        assert!(wifi[1].is_open());
+        assert_eq!(s.network.unwrap().address.as_deref(), Some("10.7.0.20/24"));
+        assert_eq!(s.time.unwrap().ntp, ["ntp.acme.lan"]);
+
+        // Nor does the audit log keep it.
+        let audit = r.call(&admin, "audit_log", json!({})).await.unwrap();
+        assert!(audit.to_string().contains("set_fleet_provisioning"));
+        assert!(!audit.to_string().contains(PASS));
+
+        // A bad value is refused before anything is made.
+        let e = r
+            .refused(
+                &line,
+                "create_provisioning_image",
+                json!({ "fleet": "line-07", "device_type": "pc",
+                        "settings": { "wifi": [{ "ssid": "x", "passphrase": "short" }] } }),
+            )
+            .await;
+        assert!(e.contains("8 to 63"), "{e}");
     }
 }
